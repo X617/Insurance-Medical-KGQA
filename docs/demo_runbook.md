@@ -44,7 +44,8 @@ NEO4J_PASSWORD=your_neo4j_password
 NEO4J_DATABASE=kgqa
 
 DEEPSEEK_API_KEY=sk-你的真实Key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
 ## 当前核心链路

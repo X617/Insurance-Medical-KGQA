@@ -198,7 +198,11 @@ class LLMIntegration:
         llm_conf = config.get("llm", {})
         
         self.model_type = llm_conf.get("model_type", "api")
-        self.model_name = llm_conf.get("model_name", "qwen-turbo")
+        self.model_name = (
+            os.getenv("DEEPSEEK_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or llm_conf.get("model_name", "deepseek-v4-pro")
+        )
         self.api_base = (
             llm_conf.get("api_base")
             or os.getenv("DEEPSEEK_BASE_URL")
