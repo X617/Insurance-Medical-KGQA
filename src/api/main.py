@@ -38,6 +38,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Insurance & Medical KGQA API", lifespan=lifespan)
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Insurance & Medical KGQA backend is running.",
+        "docs": "/docs",
+        "health": "/health",
+        "frontend": "Please open the Streamlit frontend at http://127.0.0.1:8501",
+    }
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     if not request.query:

@@ -12,6 +12,7 @@ class TextGraphBuilder:
         self.uri = config.get("neo4j", {}).get("uri", "bolt://localhost:7687")
         self.username = config.get("neo4j", {}).get("username", "neo4j")
         self.password = config.get("neo4j", {}).get("password", "password") or os.getenv("NEO4J_PASSWORD")
+        self.database = config.get("neo4j", {}).get("database") or os.getenv("NEO4J_DATABASE")
         self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
         
         # 2. 初始化 LLM
@@ -75,7 +76,7 @@ class TextGraphBuilder:
         if not triples:
             return
 
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             for item in triples:
                 try:
                     # 动态构建 Cypher (MERGE 防止重复)

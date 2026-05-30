@@ -1,6 +1,7 @@
 import json
 import csv
 import logging
+import os
 from pathlib import Path
 from typing import List, Dict, Any
 from neo4j import GraphDatabase
@@ -13,11 +14,12 @@ class Neo4jLoader:
         self.uri = config.get("neo4j", {}).get("uri", "bolt://localhost:7687")
         self.username = config.get("neo4j", {}).get("username", "neo4j")
         self.password = config.get("neo4j", {}).get("password", "password")
+        self.database = config.get("neo4j", {}).get("database") or os.getenv("NEO4J_DATABASE")
         
         try:
             self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password), max_connection_lifetime=600, keep_alive=True)
             self.verify_connection()
-            logger.info(f"Successfully connected to Neo4j at {self.uri}")
+            logger.info(f"Successfully connected to Neo4j at {self.uri}, database={self.database or '<default>'}")
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")
             logger.error("Please check your Neo4j credentials in config.yaml or environment variables.")
@@ -26,12 +28,12 @@ class Neo4jLoader:
     def clear_database(self):
         """清空数据库中的所有节点和关系（慎用）"""
         logger.warning("Clearing entire database...")
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             session.run("MATCH (n) DETACH DELETE n")
         logger.info("Database cleared.")
 
     def verify_connection(self):
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             session.run("RETURN 1")
 
     def close(self):
@@ -51,7 +53,7 @@ class Neo4jLoader:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Population) REQUIRE n.name IS UNIQUE"
         ]
         
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             for query in constraints:
                 try:
                     session.run(query)
@@ -272,7 +274,7 @@ class Neo4jLoader:
         total = len(data)
         logger.info(f"Starting import for {label}. Total records: {total}")
         
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             for i in range(0, total, batch_size):
                 batch = data[i:i + batch_size]
                 try:

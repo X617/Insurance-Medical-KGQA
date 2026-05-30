@@ -50,6 +50,9 @@ def load_config(config_path: str = None) -> Dict[str, Any]:
     if os.getenv("NEO4J_PASSWORD"):
         if "neo4j" not in config_data: config_data["neo4j"] = {}
         config_data["neo4j"]["password"] = os.getenv("NEO4J_PASSWORD")
+    if os.getenv("NEO4J_DATABASE"):
+        if "neo4j" not in config_data: config_data["neo4j"] = {}
+        config_data["neo4j"]["database"] = os.getenv("NEO4J_DATABASE")
         
     # OpenAI / LLM
     if os.getenv("OPENAI_API_KEY"):

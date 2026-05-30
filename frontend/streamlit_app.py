@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import re
+import os
 
 # ==========================================
 # 1. 配置与全局样式 (Visual Design & CSS)
@@ -97,7 +98,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # API 地址
-API_URL = "http://127.0.0.1:8000/chat"
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/chat")
 
 # ==========================================
 # 2. 功能函数
@@ -265,11 +266,8 @@ for msg in st.session_state.messages:
                  with st.expander("📚 参考来源 (Knowledge Context)"):
                     st.info(msg["context"])
 
-# --- 输入区域 ---
-prompt = st.chat_input("请描述您的情况，例如：70岁老人有高血压，推荐什么保险？")
-
 # --- 2. 输入框与回答生成 (简化版) ---
-if prompt := st.chat_input("请输入您的问题..."):
+if prompt := st.chat_input("请描述您的情况，例如：70岁老人有高血压，推荐什么保险？"):
     # 添加用户消息
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):

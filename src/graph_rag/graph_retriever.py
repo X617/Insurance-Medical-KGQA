@@ -8,7 +8,8 @@ class GraphRetriever:
     def __init__(self):
         self.uri = config.get("neo4j", {}).get("uri", "bolt://localhost:7687")
         self.username = config.get("neo4j", {}).get("username", "neo4j")
-        self.password = config.get("neo4j", {}).get("password", "password")or os.getenv("NEO4J_PASSWORD")
+        self.password = config.get("neo4j", {}).get("password", "password") or os.getenv("NEO4J_PASSWORD")
+        self.database = config.get("neo4j", {}).get("database") or os.getenv("NEO4J_DATABASE")
         
         try:
             self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
@@ -38,7 +39,7 @@ class GraphRetriever:
         city = parsed_query.get("city")
         price_max = parsed_query.get("price_max") 
         
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             
             # 1. 疾病相关检索 (并发症、药品、保险)
             if diseases:
