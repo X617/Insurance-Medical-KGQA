@@ -235,8 +235,10 @@ class LLMIntegration:
                 logger.error("❌ 致命错误: 未找到 API Key！请检查 config.yaml 或 .env 文件")
             
             self._client = OpenAI(
-                api_key=self.api_key, 
-                base_url=self.api_base
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=20.0,
+                max_retries=0,
             )
             return self._client
         except Exception as e:

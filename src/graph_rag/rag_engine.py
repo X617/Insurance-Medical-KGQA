@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from src.utils.logger import logger
 from src.graph_rag.query_understanding import QueryParser
 from src.graph_rag.graph_retriever import GraphRetriever
@@ -10,14 +10,36 @@ class RAGEngine:
         self.parser = QueryParser()
         self.retriever = GraphRetriever()
         self.llm = LLMIntegration()
+        self._response_cache = {}
+        self._response_cache_order = []
 
     # === 新增函数：独立的问题重写模块 ===
-    def _rewrite_query(self, user_query: str, history: List[Dict[str, str]]) -> str:
+    def _rewrite_query(self, user_query: str, history: List[Dict[str, str]], trace: Optional[list] = None) -> str:
         """
         利用历史记录，将用户的后续问题重写为独立完整的句子。
         例如：Context="北京有哪些养老院?", Query="价格多少?" -> Rewrite="北京的养老院价格是多少?"
         """
         if not history:
+            if trace is not None:
+                trace.append({
+                    "agent": "QueryRewriteAgent",
+                    "status": "skipped",
+                    "input": user_query,
+                    "output": user_query,
+                    "note": "无历史对话，直接使用原始问题。",
+                })
+            return user_query
+
+        followup_keywords = ["上面", "上述", "刚才", "这几个", "其中", "推荐的", "第二个", "第一个", "它", "这个", "那个", "价格多少", "适合吗"]
+        if not any(keyword in user_query for keyword in followup_keywords):
+            if trace is not None:
+                trace.append({
+                    "agent": "QueryRewriteAgent",
+                    "status": "skipped",
+                    "input": user_query,
+                    "output": user_query,
+                    "note": "未检测到明显指代追问，跳过 LLM 重写以降低延迟。",
+                })
             return user_query
 
         # 取最近的 2-3 轮对话作为上下文，节省 token 且避免干扰
@@ -45,19 +67,51 @@ class RAGEngine:
         
         # 调用 LLM 进行重写
         try:
-            rewritten_query = self.llm.generate(prompt, temperature=0.1) # 低温保证稳定
+            rewritten_query = self.llm.generate(prompt, temperature=0.1, max_tokens=80) # 低温保证稳定
             logger.info(f"🔄 Query Rewrite: '{user_query}' -> '{rewritten_query}'")
+            if trace is not None:
+                trace.append({
+                    "agent": "QueryRewriteAgent",
+                    "status": "ok",
+                    "input": user_query,
+                    "output": rewritten_query,
+                    "note": "结合最近对话历史补全省略和指代。",
+                })
             return rewritten_query
         except Exception as e:
             logger.error(f"Query rewrite failed: {e}")
+            if trace is not None:
+                trace.append({
+                    "agent": "QueryRewriteAgent",
+                    "status": "fallback",
+                    "input": user_query,
+                    "output": user_query,
+                    "note": f"重写失败，回退原问题：{e}",
+                })
             return user_query
 
     # === 修改 chat 函数，接收 history 参数 ===
-    def chat(self, user_query: str, history: List[Dict[str, str]] = []) -> dict:
+    def chat(self, user_query: str, history: Optional[List[Dict[str, str]]] = None) -> dict:
+        history = history or []
+        cache_key = user_query.strip()
+        if not history and cache_key in self._response_cache:
+            cached = dict(self._response_cache[cache_key])
+            cached["trace"] = [
+                {
+                    "agent": "CacheAgent",
+                    "status": "hit",
+                    "input": user_query,
+                    "output": "cached_response",
+                    "note": "命中本地问答缓存，跳过意图解析、图谱检索和大模型生成。",
+                },
+                *cached.get("trace", []),
+            ]
+            return cached
+        trace = []
         
         # 1. 【核心升级】多轮对话意图补全
         # 如果有历史记录，先尝试重写问题
-        current_query = self._rewrite_query(user_query, history)
+        current_query = self._rewrite_query(user_query, history, trace)
         
         # logger.info(f"Processing query (Original): {user_query}")
         logger.info(f"Processing query (Rewritten): {current_query}")
@@ -69,15 +123,58 @@ class RAGEngine:
             # ===【新增】把问题文本也塞进去，方便检索器做关键词匹配 ===
             parsed_intent['raw_query'] = current_query
             logger.info(f"Parsed intent: {parsed_intent}")
+            trace.append({
+                "agent": "IntentAgent",
+                "status": "ok",
+                "input": current_query,
+                "output": parsed_intent,
+                "note": "抽取意图、年龄、疾病、城市、预算等结构化字段。",
+            })
         except Exception as e:
             logger.error(f"Intent parsing failed: {e}")
             parsed_intent = {}
+            trace.append({
+                "agent": "IntentAgent",
+                "status": "fallback",
+                "input": current_query,
+                "output": {"intent": "general_qa"},
+                "note": f"意图解析失败，使用兜底意图：{e}",
+            })
 
         # 3. 图谱检索（使用重写后的问题）
         try:
-            context = self.retriever.retrieve(parsed_intent)
+            retrieval_payload = self.retriever.retrieve_structured(parsed_intent)
+            context = retrieval_payload["context"]
+            recs = retrieval_payload.get("recommendations", {})
+            trace.append({
+                "agent": "RetrieverAgent",
+                "status": "ok",
+                "input": parsed_intent,
+                "output": {
+                    "source_count": len(retrieval_payload.get("sources", [])),
+                    "graph_nodes": len(retrieval_payload.get("graph", {}).get("nodes", [])),
+                    "graph_edges": len(retrieval_payload.get("graph", {}).get("edges", [])),
+                    "insurance_candidates": len(recs.get("insurance", [])),
+                    "nursing_home_candidates": len(recs.get("nursing_homes", [])),
+                },
+                "note": "执行图谱召回、关键词语义兜底召回与规则重排。",
+            })
         except Exception as e:
+            logger.error(f"Graph retrieval failed: {e}")
             context = "检索失败"
+            retrieval_payload = {
+                "context": context,
+                "sources": [],
+                "graph": {"nodes": [], "edges": [], "paths": []},
+                "recommendations": {"insurance": [], "nursing_homes": []},
+            }
+            trace.append({
+                "agent": "RetrieverAgent",
+                "status": "failed",
+                "input": parsed_intent,
+                "output": context,
+                "note": str(e),
+            })
 
         # 4. 生成回答
         # 提取上一轮 AI 的回答，作为补充上下文
@@ -94,6 +191,30 @@ class RAGEngine:
                 logger.info("🔒 检测到指代性追问，强制屏蔽新检索结果，仅依赖历史记录。")
                 # 关键操作：把 context 替换掉！让 AI 没得选，只能看 history
                 context = "（本轮检索结果已屏蔽，请严格基于 [用户上轮对话历史] 回答）"
+                retrieval_payload["context"] = context
+                trace.append({
+                    "agent": "ComplianceAgent",
+                    "status": "ok",
+                    "input": user_query,
+                    "output": "history_only",
+                    "note": "检测到指代性追问，避免引入新的无关产品。",
+                })
+            else:
+                trace.append({
+                    "agent": "ComplianceAgent",
+                    "status": "ok",
+                    "input": user_query,
+                    "output": "graph_context_allowed",
+                    "note": "使用当前图谱检索结果，并保留历史上下文。",
+                })
+        else:
+            trace.append({
+                "agent": "ComplianceAgent",
+                "status": "ok",
+                "input": user_query,
+                "output": "single_turn",
+                "note": "单轮问题，使用图谱检索结果与硬规则过滤候选。",
+            })
 
         # System Prompt 保持不变...
         system_prompt = """
@@ -141,6 +262,9 @@ class RAGEngine:
         
         {context}
 
+        [结构化候选推荐 - Recommendations]
+        {retrieval_payload.get("recommendations", {})}
+
         [用户当前问题 - Current Question]
         {current_query}
 
@@ -149,16 +273,41 @@ class RAGEngine:
 
         # 生成回答
         try:
-            answer = self.llm.generate(prompt=user_prompt, system_prompt=system_prompt, temperature=0.1) # 温度调低，让它更听话
+            answer = self.llm.generate(prompt=user_prompt, system_prompt=system_prompt, temperature=0.1, max_tokens=900) # 温度调低，让它更听话
+            trace.append({
+                "agent": "AnswerAgent",
+                "status": "ok",
+                "input": "context + recommendations + current_question",
+                "output": answer[:240],
+                "note": "基于检索上下文和结构化候选生成最终回答。",
+            })
         except Exception as e:
             logger.error(f"Generate failed: {e}")
             answer = "抱歉，生成回答时出现错误。"
-        return {
+            trace.append({
+                "agent": "AnswerAgent",
+                "status": "failed",
+                "input": "context + recommendations + current_question",
+                "output": answer,
+                "note": str(e),
+            })
+        result = {
             "answer": answer,
             "context": context,
             "intent": parsed_intent,
-            "rewritten_query": current_query # 可以返回给前端看看效果
+            "rewritten_query": current_query, # 可以返回给前端看看效果
+            "sources": retrieval_payload.get("sources", []),
+            "graph": retrieval_payload.get("graph", {"nodes": [], "edges": [], "paths": []}),
+            "recommendations": retrieval_payload.get("recommendations", {"insurance": [], "nursing_homes": []}),
+            "trace": trace,
         }
+        if not history and cache_key:
+            self._response_cache[cache_key] = result
+            self._response_cache_order.append(cache_key)
+            if len(self._response_cache_order) > 64:
+                oldest = self._response_cache_order.pop(0)
+                self._response_cache.pop(oldest, None)
+        return result
 
     def close(self):
         self.retriever.close()

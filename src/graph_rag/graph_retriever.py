@@ -3,6 +3,16 @@ import os
 from neo4j import GraphDatabase
 from src.utils.config_loader import config
 from src.utils.logger import logger
+from src.graph_rag.recommendation_utils import (
+    build_suitable_reason,
+    insurance_risk_tags,
+    normalize_city,
+    parse_age_range,
+    parse_price_value,
+    score_insurance,
+    score_nursing_home,
+)
+from src.graph_rag.lightweight_vector_index import LightweightVectorIndex
 
 class GraphRetriever:
     def __init__(self):
@@ -10,9 +20,16 @@ class GraphRetriever:
         self.username = config.get("neo4j", {}).get("username", "neo4j")
         self.password = config.get("neo4j", {}).get("password", "password") or os.getenv("NEO4J_PASSWORD")
         self.database = config.get("neo4j", {}).get("database") or os.getenv("NEO4J_DATABASE")
+        self.vector_index = LightweightVectorIndex()
         
         try:
-            self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+            self.driver = GraphDatabase.driver(
+                self.uri,
+                auth=(self.username, self.password),
+                connection_timeout=3,
+                max_connection_pool_size=10,
+                max_transaction_retry_time=1,
+            )
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")
             self.driver = None
@@ -20,6 +37,135 @@ class GraphRetriever:
     def close(self):
         if self.driver:
             self.driver.close()
+
+    def get_graph_stats(self) -> dict:
+        if not self.driver:
+            return {"connected": False, "labels": {}, "relationships": 0}
+        try:
+            with self.driver.session(database=self.database) as session:
+                labels = {
+                    row["label"]: row["cnt"]
+                    for row in session.run(
+                        """
+                        MATCH (n)
+                        UNWIND labels(n) AS label
+                        RETURN label, count(*) AS cnt
+                        ORDER BY cnt DESC
+                        """
+                    )
+                }
+                rels = session.run("MATCH ()-[r]->() RETURN count(r) AS cnt").single()["cnt"]
+            return {"connected": True, "labels": labels, "relationships": rels}
+        except Exception as exc:
+            return {"connected": False, "labels": {}, "relationships": 0, "error": str(exc)}
+
+    def get_subgraph(self, entity: str = "", query: str = "", depth: int = 1, limit: int = 40) -> dict:
+        if not self.driver:
+            return {"nodes": [], "edges": [], "paths": [], "message": "Database connection unavailable."}
+
+        seed = (entity or query or "").strip()
+        if not seed:
+            return {"nodes": [], "edges": [], "paths": [], "message": "Missing entity or query."}
+
+        depth = max(1, min(int(depth or 1), 2))
+        limit = max(5, min(int(limit or 40), 80))
+        cypher = f"""
+        MATCH (start)
+        WHERE start.name CONTAINS $seed OR $seed CONTAINS start.name
+        WITH start LIMIT 5
+        MATCH path=(start)-[*0..{depth}]-(n)
+        WITH path LIMIT $limit
+        RETURN path
+        """
+
+        nodes = {}
+        edges = {}
+        paths = []
+        with self.driver.session(database=self.database) as session:
+            for row in session.run(cypher, seed=seed, limit=limit):
+                path = row["path"]
+                names = []
+                for node in path.nodes:
+                    node_id = str(node.element_id)
+                    props = dict(node)
+                    label = next(iter(node.labels), "Entity")
+                    nodes[node_id] = {
+                        "id": node_id,
+                        "label": label,
+                        "name": props.get("name", node_id),
+                        "properties": props,
+                    }
+                    names.append(props.get("name", label))
+                for rel in path.relationships:
+                    rel_id = str(rel.element_id)
+                    edges[rel_id] = {
+                        "id": rel_id,
+                        "source": str(rel.start_node.element_id),
+                        "target": str(rel.end_node.element_id),
+                        "type": rel.type,
+                        "properties": dict(rel),
+                    }
+                if len(names) >= 2:
+                    paths.append(" -> ".join(names))
+
+        return {"nodes": list(nodes.values()), "edges": list(edges.values()), "paths": paths[:10]}
+
+    def _fallback_keyword_sources(self, raw_query: str, limit: int = 5) -> list:
+        """Lightweight lexical recall used as a CPU-only HybridRAG fallback."""
+        if not raw_query or not self.driver:
+            return []
+        keywords = [kw for kw in ["高血压", "糖尿病", "癌症", "医疗", "重疾", "防癌", "养老", "护理", "北京", "上海", "成都"] if kw in raw_query]
+        if not keywords:
+            keywords = [raw_query[:8]]
+        with self.driver.session(database=self.database) as session:
+            rows = session.run(
+                """
+                MATCH (n)
+                WHERE any(kw IN $keywords WHERE
+                    coalesce(n.name, '') CONTAINS kw OR
+                    coalesce(n.description, '') CONTAINS kw OR
+                    coalesce(n.intro, '') CONTAINS kw OR
+                    coalesce(n.services, '') CONTAINS kw
+                )
+                RETURN labels(n)[0] AS label, n.name AS name,
+                       coalesce(n.description, n.intro, n.services, n.address, '') AS text
+                LIMIT $limit
+                """,
+                keywords=keywords,
+                limit=limit,
+            )
+            return [
+                {
+                    "type": "hybrid_keyword",
+                    "label": r["label"],
+                    "name": r["name"],
+                    "snippet": (r["text"] or "")[:160],
+                    "score": 0.62,
+                }
+                for r in rows
+            ]
+
+    def retrieve_structured(self, parsed_query: dict) -> dict:
+        context = self.retrieve(parsed_query)
+        payload = getattr(self, "_last_payload", {}) or {}
+        payload.setdefault("context", context)
+        payload.setdefault("sources", [])
+        payload.setdefault("recommendations", {"insurance": [], "nursing_homes": []})
+        payload.setdefault("graph", {"nodes": [], "edges": [], "paths": []})
+
+        raw_query = parsed_query.get("raw_query", "")
+        existing = {(s.get("label"), s.get("name")) for s in payload["sources"]}
+        for src in self.vector_index.search(raw_query, top_k=5):
+            key = (src.get("label"), src.get("name"))
+            if key not in existing:
+                payload["sources"].append(src)
+                existing.add(key)
+        for src in self._fallback_keyword_sources(raw_query):
+            key = (src.get("label"), src.get("name"))
+            if key not in existing:
+                payload["sources"].append(src)
+
+        return payload
 
     def retrieve(self, parsed_query: dict) -> str:
         """
@@ -30,14 +176,52 @@ class GraphRetriever:
             return "Error: Database connection unavailable."
 
         context_parts = []
+        sources = []
+        graph_nodes = {}
+        graph_edges = {}
+        graph_paths = []
+        recommendations = {"insurance": [], "nursing_homes": []}
         intent = parsed_query.get("intent", "general_qa")
         diseases = parsed_query.get("disease", [])
         drugs = parsed_query.get("drug", [])
         age = parsed_query.get("age")
+        if isinstance(diseases, str):
+            diseases = [diseases]
+        if isinstance(drugs, str):
+            drugs = [drugs]
+        if isinstance(age, str) and age.isdigit():
+            age = int(age)
         
         # === 修改点 1: 获取解析出的城市和价格上限 ===
-        city = parsed_query.get("city")
+        city = normalize_city(parsed_query.get("city"))
         price_max = parsed_query.get("price_max") 
+        if isinstance(price_max, str):
+            digits = "".join(ch for ch in price_max if ch.isdigit())
+            price_max = int(digits) if digits else None
+
+        def add_node(label, name, properties=None):
+            if not name:
+                return None
+            node_id = f"{label}:{name}"
+            graph_nodes[node_id] = {
+                "id": node_id,
+                "label": label,
+                "name": name,
+                "properties": properties or {},
+            }
+            return node_id
+
+        def add_edge(source, target, rel_type, properties=None):
+            if not source or not target:
+                return
+            edge_id = f"{source}->{rel_type}->{target}"
+            graph_edges[edge_id] = {
+                "id": edge_id,
+                "source": source,
+                "target": target,
+                "type": rel_type,
+                "properties": properties or {},
+            }
         
         with self.driver.session(database=self.database) as session:
             
@@ -74,6 +258,14 @@ class GraphRetriever:
                         if drug_list:
                             info += f"  - 常用药物: {', '.join(drug_list[:5])}\n"
                         context_parts.append(info)
+                        d_id = add_node("Disease", disease_name, dict(d_node))
+                        sources.append({"type": "graph", "label": "Disease", "name": disease_name, "snippet": info[:180], "score": 0.95})
+                        for symptom in symptom_list[:5]:
+                            s_id = add_node("Symptom", symptom)
+                            add_edge(d_id, s_id, "HAS_SYMPTOM")
+                        for drug_name in drug_list[:5]:
+                            m_id = add_node("Drug", drug_name)
+                            add_edge(d_id, m_id, "TREATED_BY")
 
                     # 检索覆盖该疾病的保险
                     cypher_insurance = """
@@ -161,18 +353,42 @@ class GraphRetriever:
                 
                 ins_data = []
                 for r in gen_results:
+                    min_age, max_age = parse_age_range(r["age_limit"])
+                    tags = insurance_risk_tags(r["name"], r.get("category", ""), r["desc"] or "")
                     ins_data.append({
                         "name": r['name'],
                         "category": r.get('category', '未知'),
                         "age_limit": r['age_limit'],
-                        "desc": r['desc']
+                        "description": r['desc'] or "",
+                        "price": r.get("price"),
+                        "price_value": parse_price_value(r.get("price")),
+                        "min_age": min_age,
+                        "max_age": max_age,
+                        "risk_tags": tags,
                     })
+
+                for item in ins_data:
+                    item["score"] = score_insurance(item, age, diseases, raw_query)
+                    item["suitable_reason"] = build_suitable_reason(item, age, diseases)
+
+                ins_data = [item for item in ins_data if item["score"] > -999]
+                ins_data.sort(key=lambda x: x["score"], reverse=True)
+                recommendations["insurance"] = ins_data[:6]
                 
                 # 格式化输出给 LLM
                 filtered_ins_list = []
-                for item in ins_data:
-                    item_str = f"【产品】{item['name']}\n   - 险种: {item['category']}\n   - 投保年龄: {item['age_limit']}\n   - 描述: {item['desc'][:50]}..."
+                for item in recommendations["insurance"]:
+                    item_str = f"【产品】{item['name']}\n   - 险种: {item['category']}\n   - 投保年龄: {item['age_limit']}\n   - 推荐分: {item['score']}\n   - 推荐理由: {item['suitable_reason']}\n   - 描述: {item['description'][:80]}..."
                     filtered_ins_list.append(item_str)
+                    ins_id = add_node("Insurance", item["name"], item)
+                    sources.append({"type": "graph", "label": "Insurance", "name": item["name"], "snippet": item_str, "score": item["score"] / 100})
+                    if age is not None:
+                        pop_id = add_node("Population", f"{age}岁用户", {"age": age})
+                        add_edge(ins_id, pop_id, "AGE_MATCH")
+                    for disease_name in diseases or []:
+                        d_id = add_node("Disease", disease_name)
+                        add_edge(ins_id, d_id, "RELATED_TO_DISEASE")
+                        graph_paths.append(f"{disease_name} -> RELATED_TO_DISEASE -> {item['name']}")
                 
                 if filtered_ins_list:
                     context_parts.append(f"【保险产品库】(已根据关键词 '{specific_keyword or '通用'}' 筛选):\n" + "\n".join(filtered_ins_list))
@@ -216,6 +432,17 @@ class GraphRetriever:
                 
                 nh_list = []
                 for r in nh_results:
+                    item = {
+                        "name": r["name"],
+                        "price": r["price"],
+                        "price_value": parse_price_value(r["price"]),
+                        "address": r["address"],
+                        "services": r["services"],
+                        "beds": r["beds"],
+                        "nature": r["nature"],
+                    }
+                    item["score"] = score_nursing_home(item, city, price_max)
+                    recommendations["nursing_homes"].append(item)
                     # 4. 【关键修改】构建详细的信息卡片，而不是简单的一句话
                     detail = f"【{r['name']}】"
                     detail += f"\n  - 价格: {r['price']}元/月"
@@ -232,6 +459,21 @@ class GraphRetriever:
                         detail += f"\n  - 特色服务: {services}"
                     
                     nh_list.append(detail)
+
+                recommendations["nursing_homes"] = [
+                    item for item in recommendations["nursing_homes"] if item["score"] > -999
+                ]
+                recommendations["nursing_homes"].sort(key=lambda x: x["score"], reverse=True)
+                recommendations["nursing_homes"] = recommendations["nursing_homes"][:6]
+                for item in recommendations["nursing_homes"]:
+                    nh_id = add_node("NursingHome", item["name"], item)
+                    sources.append({"type": "graph", "label": "NursingHome", "name": item["name"], "snippet": f"{item['address']}，{item['price']}元/月，{item['services']}", "score": item["score"] / 100})
+                    if city:
+                        city_id = add_node("City", city)
+                        add_edge(nh_id, city_id, "LOCATED_IN")
+                    if item.get("services"):
+                        service_id = add_node("Service", "医养服务")
+                        add_edge(nh_id, service_id, "PROVIDES")
                 
                 if nh_list:
                     # 将结构化的文本加入 context
@@ -241,9 +483,21 @@ class GraphRetriever:
                     context_parts.append(f"【养老机构】未找到符合条件的养老院 (城市: {city}, 预算: {price_max})。")
 
         # === ！！！必须确保这下面有这两行代码！！！ ===
+        self._last_payload = {
+            "sources": sources[:12],
+            "recommendations": recommendations,
+            "graph": {
+                "nodes": list(graph_nodes.values()),
+                "edges": list(graph_edges.values()),
+                "paths": graph_paths[:10],
+            },
+        }
+
         if not context_parts:
+            self._last_payload["context"] = "知识图谱检索完成，但在图谱中未发现与该特定实体或条件直接匹配的记录。"
             return "知识图谱检索完成，但在图谱中未发现与该特定实体或条件直接匹配的记录。"
         
+        self._last_payload["context"] = "\n".join(context_parts)
         return "\n".join(context_parts)  # <--- 这行丢失会导致报错！
 
 if __name__ == "__main__":

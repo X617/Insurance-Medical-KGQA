@@ -9,10 +9,57 @@ class QueryParser:
         # 这样它就能自动读取 .env 里的 DASHSCOPE_API_KEY 了
         self.llm = LLMIntegration()
 
+    def _rule_parse(self, query: str) -> dict:
+        """Fast deterministic parser for common demo queries, avoiding an LLM hop."""
+        result = {}
+        text = query or ""
+
+        age_match = re.search(r"(\d{1,3})\s*岁", text)
+        if age_match:
+            result["age"] = int(age_match.group(1))
+
+        price_match = re.search(r"(\d{3,6})\s*(?:元|块|￥|以下|以内|内|预算)", text)
+        if price_match:
+            result["price_max"] = int(price_match.group(1))
+
+        city_match = re.search(r"(北京|上海|广州|深圳|成都|武汉|杭州|南京|重庆|天津|西安|苏州|长沙|郑州|青岛|厦门|朝阳区|海淀区|通州|房山)", text)
+        if city_match:
+            result["city"] = city_match.group(1)
+
+        diseases = []
+        for disease in ("高血压", "糖尿病", "冠心病", "癌症", "恶性肿瘤", "肺炎", "脑梗", "心梗", "阿尔茨海默病"):
+            if disease in text:
+                diseases.append(disease)
+        if diseases:
+            result["disease"] = diseases
+
+        drugs = []
+        for drug in ("阿司匹林", "二甲双胍", "胰岛素", "硝苯地平", "氨氯地平"):
+            if drug in text:
+                drugs.append(drug)
+        if drugs:
+            result["drug"] = drugs
+
+        if any(k in text for k in ("养老院", "养老机构", "护理院", "床位", "月费", "养老")):
+            result["intent"] = "nursing_home_search"
+        elif any(k in text for k in ("保险", "投保", "保费", "医疗险", "重疾险", "防癌险", "护理险", "保障")):
+            result["intent"] = "insurance_query"
+        elif diseases or drugs or any(k in text for k in ("症状", "并发症", "治疗", "药")):
+            result["intent"] = "medical_query"
+        else:
+            result["intent"] = "general_qa"
+
+        result["_parser"] = "rule"
+        return result
+
     def parse(self, query: str) -> dict:
         """
         利用大模型解析用户查询意图和关键实体。
         """
+        rule_result = self._rule_parse(query)
+        if rule_result.get("intent") != "general_qa" or any(k in rule_result for k in ("age", "price_max", "city", "disease", "drug")):
+            return rule_result
+
         system_prompt = """
         你是一个智能意图识别助手。你的任务是分析用户的自然语言问题，提取关键信息，并以严格的 JSON 格式返回。
         
@@ -34,13 +81,15 @@ class QueryParser:
         """
 
         user_prompt = f"用户问题：{query}"
+        response_text = ""
 
         try:
             # 调用 LLM 生成解析结果
             response_text = self.llm.generate(
                 prompt=user_prompt, 
                 system_prompt=system_prompt,
-                temperature=0.1 # 意图识别需要精确，温度调低
+                temperature=0.1, # 意图识别需要精确，温度调低
+                max_tokens=200,
             )
             
             # 清理可能存在的 Markdown 格式

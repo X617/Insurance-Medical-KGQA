@@ -86,9 +86,10 @@ fi
 cleanup() {
   if [ -n "${BACKEND_PID:-}" ]; then
     kill "$BACKEND_PID" 2>/dev/null || true
+    wait "$BACKEND_PID" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 python -m uvicorn src.api.main:app \
   --host "$BACKEND_HOST" \
