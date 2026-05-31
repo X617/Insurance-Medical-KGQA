@@ -1,10 +1,32 @@
 import csv
 import json
 import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List
 
 from src.utils.config_loader import get_project_root
+
+
+@dataclass
+class EvidenceChunk:
+    id: str
+    label: str
+    name: str
+    text: str
+    source_type: str
+    score: float
+    node_ref: str = ""
+    graph_score: float = 0.0
+    vector_score: float = 0.0
+    rule_score: float = 0.0
+    hybrid_score: float = 0.0
+
+    def to_source(self) -> Dict[str, object]:
+        data = asdict(self)
+        data["type"] = self.source_type
+        data["snippet"] = self.text[:180]
+        return data
 
 
 class LightweightVectorIndex:
@@ -34,7 +56,7 @@ class LightweightVectorIndex:
     def _add_record(self, label: str, name: str, text: str) -> None:
         if not name or len(self.records) >= self.max_records:
             return
-        self.records.append({"label": label, "name": name, "text": text or ""})
+        self.records.append({"label": label, "name": name, "text": text or "", "id": f"{label}:{name}"})
 
     def load(self) -> None:
         if self._loaded:
@@ -82,12 +104,16 @@ class LightweightVectorIndex:
                 scored.append((score, record))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [
-            {
-                "type": "hybrid_vector",
-                "label": record["label"],
-                "name": record["name"],
-                "snippet": record["text"][:180],
-                "score": round(float(score), 4),
-            }
+            EvidenceChunk(
+                id=record["id"],
+                label=record["label"],
+                name=record["name"],
+                text=record["text"],
+                source_type="hybrid_vector",
+                score=round(float(score), 4),
+                node_ref=record["id"],
+                vector_score=round(float(score), 4),
+                hybrid_score=round(0.35 * float(score), 4),
+            ).to_source()
             for score, record in scored[:top_k]
         ]

@@ -19,6 +19,7 @@ st.set_page_config(
 
 API_ROOT = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 CHAT_URL = os.getenv("API_URL", f"{API_ROOT}/chat")
+STREAM_URL = f"{API_ROOT}/chat/stream"
 
 PRIMARY = "#2563eb"
 SECONDARY = "#0f766e"
@@ -289,6 +290,24 @@ def render_recommendations(recommendations: Dict[str, Any]) -> None:
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
+def render_reasoning_paths(paths: List[Dict[str, Any]]) -> None:
+    if not paths:
+        return
+    st.markdown("**StepChain 证据路径**")
+    for item in paths[:6]:
+        path = " → ".join(str(part) for part in item.get("path", []) if part)
+        st.markdown(
+            f"""
+<div class="trace-step">
+  <div class="trace-agent">{html.escape(str(item.get("title", "证据路径")))}</div>
+  <div>{html.escape(path)}</div>
+  <div class="small-muted">{html.escape(str(item.get("evidence", ""))[:220])}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+
 def render_sources(sources: List[Dict[str, Any]]) -> None:
     if not sources:
         st.info("暂无结构化证据来源。")
@@ -299,6 +318,7 @@ def render_sources(sources: List[Dict[str, Any]]) -> None:
 <div class="source-line">
   <b>{html.escape(str(src.get("label") or src.get("type") or "Source"))}</b>
   · {html.escape(str(src.get("name", "")))}
+  <span class="small-muted"> · hybrid={html.escape(str(src.get("hybrid_score", src.get("score", "-"))))}</span>
   <div class="small-muted">{html.escape(str(src.get("snippet", ""))[:260])}</div>
 </div>
 """,
@@ -331,7 +351,7 @@ def render_trace(trace: List[Dict[str, Any]]) -> None:
 
 
 def upload_document_panel() -> None:
-    st.markdown("### 多模态资料问答")
+    st.markdown("### 资料解析工作台")
     uploaded = st.file_uploader("上传保险条款 PDF / txt / 图片", type=["pdf", "txt", "png", "jpg", "jpeg", "webp"])
     if uploaded and st.button("解析资料", use_container_width=True):
         encoded = base64.b64encode(uploaded.getvalue()).decode("ascii")
@@ -341,6 +361,8 @@ def upload_document_panel() -> None:
             if resp.status_code == 200:
                 data = resp.json()
                 st.session_state.document_id = data["document_id"]
+                st.session_state.document_filename = data["filename"]
+                st.session_state.extracted_triples = []
                 st.success(f"已解析：{data['filename']}，共 {data['chars']} 字")
                 st.text_area("资料摘要", data["summary"], height=150)
             else:
@@ -349,6 +371,54 @@ def upload_document_panel() -> None:
             st.error(f"资料上传失败：{exc}")
 
     if st.session_state.get("document_id"):
+        st.info(f"当前资料：{st.session_state.get('document_filename', st.session_state.document_id)}")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("抽取三元组", use_container_width=True):
+                resp = requests.post(
+                    f"{API_ROOT}/documents/{st.session_state.document_id}/extract-triples",
+                    timeout=80,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    st.session_state.extracted_triples = data.get("triples", [])
+                    st.success(f"抽取完成：{len(st.session_state.extracted_triples)} 条，方法：{data.get('method')}")
+                else:
+                    st.error(resp.text)
+        with col_b:
+            triples = st.session_state.get("extracted_triples") or []
+            if st.button("Dry-run 校验", use_container_width=True, disabled=not triples):
+                resp = requests.post(
+                    f"{API_ROOT}/admin/ingest-triples",
+                    params={"dry_run": "true"},
+                    json={"triples": triples},
+                    timeout=20,
+                )
+                st.json(resp.json() if resp.status_code == 200 else {"error": resp.text})
+
+        if st.session_state.get("extracted_triples"):
+            edited = st.data_editor(
+                st.session_state.extracted_triples,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="triple_editor",
+            )
+            if st.button("确认写入 Neo4j", type="primary", use_container_width=True):
+                triples_to_write = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
+                resp = requests.post(
+                    f"{API_ROOT}/admin/ingest-triples",
+                    params={"dry_run": "false"},
+                    json={"triples": triples_to_write},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    st.success(f"已写入 {resp.json().get('inserted', 0)} 条三元组。")
+                    get_graph_stats.clear()
+                    cached_subgraph.clear()
+                else:
+                    st.error(resp.text)
+
         q = st.text_input("围绕已上传资料追问", placeholder="例如：这份条款 70 岁能不能买？")
         if q and st.button("询问资料", use_container_width=True):
             resp = requests.post(
@@ -360,6 +430,41 @@ def upload_document_panel() -> None:
                 st.markdown(resp.json()["answer"])
             else:
                 st.error(resp.text)
+
+
+def metrics_panel() -> None:
+    st.markdown("### 系统评测与性能仪表盘")
+    metrics = api_get("/metrics/demo", timeout=4.0)
+    if not metrics:
+        st.warning("暂未获取到后端指标，请确认 FastAPI 已启动。")
+        return
+    cols = st.columns(4)
+    cards = [
+        ("平均响应", f"{metrics.get('avg_latency_ms', 0)} ms"),
+        ("缓存命中率", f"{metrics.get('cache_hit_rate', 0) * 100:.1f}%"),
+        ("图谱命中率", f"{metrics.get('graph_hit_rate', 0) * 100:.1f}%"),
+        ("规则过滤", str(metrics.get("rule_filter_hits", 0))),
+    ]
+    for col, (label, value) in zip(cols, cards):
+        with col:
+            render_metric(label, value)
+    graph_stats = metrics.get("graph_stats", {})
+    st.markdown(
+        f"图谱连接：**{'正常' if metrics.get('graph_connected') else '异常'}**　"
+        f"节点标签：`{len(graph_stats.get('labels', {}))}`　"
+        f"关系数：`{graph_stats.get('relationships', 0)}`"
+    )
+    st.markdown("**Golden Queries 覆盖面**")
+    golden = [
+        "70岁老人有高血压，推荐什么保险？",
+        "北京5000元以下有哪些养老院？",
+        "上面第二个适合糖尿病老人吗？",
+        "糖尿病有哪些并发症？",
+        "蓝医保适合高血压老人吗？",
+        "这份条款70岁能不能买？",
+    ]
+    st.dataframe([{"问题": q, "覆盖能力": "GraphRAG / 规则过滤 / 多轮 / 资料问答"} for q in golden], use_container_width=True, hide_index=True)
+    st.caption("完整评测可在终端运行：python scripts/eval_demo.py")
 
 
 def request_chat_reply(prompt: str) -> Dict[str, Any]:
@@ -391,6 +496,7 @@ def request_chat_reply(prompt: str) -> Dict[str, Any]:
                 "graph": data.get("graph", {}),
                 "recommendations": data.get("recommendations", {}),
                 "trace": data.get("trace", []),
+                "reasoning_paths": data.get("reasoning_paths", []),
             }
         return {
             "role": "assistant",
@@ -413,10 +519,38 @@ def request_chat_reply(prompt: str) -> Dict[str, Any]:
         }
 
 
+def iter_sse_chat(prompt: str):
+    history_payload = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages
+    ][-6:]
+    response = requests.post(
+        STREAM_URL,
+        json={"query": prompt, "history": history_payload},
+        timeout=(3, 45),
+        stream=True,
+    )
+    response.raise_for_status()
+    current_event = "message"
+    data_lines: List[str] = []
+    for raw_line in response.iter_lines(decode_unicode=True):
+        line = raw_line or ""
+        if line.startswith("event:"):
+            current_event = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+        elif line == "" and data_lines:
+            payload = json.loads("\n".join(data_lines))
+            yield current_event, payload
+            current_event = "message"
+            data_lines = []
+
+
 def render_assistant_details(msg: Dict[str, Any], expanded_graph: bool = False, include_trace: bool = True) -> None:
     render_recommendations(msg.get("recommendations", {}))
     with st.expander("知识图谱证据图", expanded=expanded_graph):
         render_graph(msg.get("graph", {}))
+        render_reasoning_paths(msg.get("reasoning_paths") or msg.get("graph", {}).get("reasoning_paths", []))
         for path in (msg.get("graph", {}).get("paths") or [])[:5]:
             st.caption(path)
     if include_trace:
@@ -451,17 +585,59 @@ def render_current_turn(prompt: str) -> None:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.status("正在执行 Agent 推理、图谱检索与合规过滤...", expanded=False) as status:
-            live_box = st.empty()
-            render_live_reasoning(live_box, active="QueryRewriteAgent")
-            render_live_reasoning(live_box, active="IntentAgent")
-            render_live_reasoning(live_box, active="RetrieverAgent")
-            render_live_reasoning(live_box, active="ComplianceAgent")
-            render_live_reasoning(live_box, active="AnswerAgent")
+        answer_box = st.empty()
+        trace_holder = st.empty()
+        details_holder = st.empty()
+        answer_text = ""
+        trace: List[Dict[str, Any]] = []
+        assistant_msg = {
+            "role": "assistant",
+            "content": "",
+            "context": "",
+            "sources": [],
+            "graph": {},
+            "recommendations": {},
+            "trace": [],
+            "reasoning_paths": [],
+        }
+        try:
+            with st.status("Agent 推理中：意图解析、HybridRAG 检索、规则过滤与答案生成...", expanded=False) as status:
+                for event, payload in iter_sse_chat(prompt):
+                    if event == "trace_step":
+                        trace.append(payload)
+                        with trace_holder.expander("实时推理链路", expanded=False):
+                            render_trace(trace)
+                    elif event == "token":
+                        answer_text += payload.get("text", "")
+                        answer_box.markdown(answer_text + "▌")
+                    elif event == "retrieval":
+                        assistant_msg.update({
+                            "sources": payload.get("sources", []),
+                            "graph": payload.get("graph", {}),
+                            "recommendations": payload.get("recommendations", {}),
+                            "reasoning_paths": payload.get("reasoning_paths", []),
+                        })
+                    elif event == "final":
+                        assistant_msg.update({
+                            "content": payload.get("answer", answer_text),
+                            "context": payload.get("context", ""),
+                            "sources": payload.get("sources", assistant_msg.get("sources", [])),
+                            "graph": payload.get("graph", assistant_msg.get("graph", {})),
+                            "recommendations": payload.get("recommendations", assistant_msg.get("recommendations", {})),
+                            "trace": payload.get("trace", trace),
+                            "reasoning_paths": payload.get("reasoning_paths", assistant_msg.get("reasoning_paths", [])),
+                        })
+                    elif event == "error":
+                        raise RuntimeError(payload.get("message", "流式接口异常"))
+                status.update(label="Agent 推理完成，正在渲染回答与证据链。", state="complete", expanded=False)
+        except Exception as exc:
+            st.warning(f"流式接口暂不可用，已回退同步接口：{exc}")
             assistant_msg = request_chat_reply(prompt)
-            status.update(label="Agent 推理完成，正在渲染回答与证据链。", state="complete", expanded=False)
 
-        st.markdown(assistant_msg["content"])
+        if not assistant_msg.get("content"):
+            assistant_msg["content"] = answer_text or "抱歉，暂时没有生成有效回答。"
+            assistant_msg["trace"] = trace
+        answer_box.markdown(assistant_msg["content"])
         render_assistant_details(
             assistant_msg,
             expanded_graph=bool(assistant_msg.get("graph", {}).get("nodes")),
@@ -578,7 +754,7 @@ else:
 if typed_prompt := st.chat_input("请描述您的情况，例如：70岁老人有高血压，推荐什么保险？"):
     chat_prompt_to_submit = typed_prompt
 
-tab_chat, tab_upload, tab_graph = st.tabs(["智能问答", "资料问答", "图谱探索"])
+tab_chat, tab_upload, tab_graph, tab_metrics = st.tabs(["智能问答", "资料解析", "图谱探索", "系统评测"])
 
 with tab_chat:
     for idx, msg in enumerate(st.session_state.messages):
@@ -606,3 +782,6 @@ with tab_graph:
         graph = st.session_state.explore_graph
         render_graph(graph, height=360)
         st.json({"nodes": len(graph.get("nodes", [])), "edges": len(graph.get("edges", [])), "paths": graph.get("paths", [])[:8]})
+
+with tab_metrics:
+    metrics_panel()

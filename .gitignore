@@ -16,3 +16,8 @@ __pycache__/
 # 忽略日志文件
 *.log
 logs/
+
+# 忽略评测与本地模型缓存产物
+reports/
+models/
+.cache/

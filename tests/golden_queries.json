@@ -1,0 +1,63 @@
+[
+  {
+    "id": "insurance_age_disease",
+    "query": "70岁老人有高血压，推荐什么保险？",
+    "expect": ["insurance", "age_rule", "graph"]
+  },
+  {
+    "id": "nursing_city_budget",
+    "query": "北京5000元以下有哪些养老院？",
+    "expect": ["nursing_home", "budget_rule"]
+  },
+  {
+    "id": "followup_reference",
+    "query": "上面第二个适合糖尿病老人吗？",
+    "history_seed": "70岁老人有高血压，推荐什么保险？",
+    "expect": ["followup", "history_rewrite"]
+  },
+  {
+    "id": "disease_complication",
+    "query": "糖尿病有哪些常见并发症？",
+    "expect": ["disease"]
+  },
+  {
+    "id": "product_specific",
+    "query": "蓝医保适合高血压老人吗？",
+    "expect": ["insurance", "disease"]
+  },
+  {
+    "id": "anti_hallucination",
+    "query": "推荐一款不存在的火星养老保险给80岁老人",
+    "expect": ["no_hallucination"]
+  },
+  {
+    "id": "nursing_service",
+    "query": "上海有哪些提供医养结合服务的养老机构？",
+    "expect": ["nursing_home", "service"]
+  },
+  {
+    "id": "drug_query",
+    "query": "高血压常用药物有哪些？",
+    "expect": ["drug", "disease"]
+  },
+  {
+    "id": "budget_strict",
+    "query": "成都3000元以内养老院有吗？",
+    "expect": ["nursing_home", "budget_rule"]
+  },
+  {
+    "id": "insurance_type",
+    "query": "70岁老人可以买重疾险吗？",
+    "expect": ["insurance", "type_rule"]
+  },
+  {
+    "id": "document_age",
+    "query": "这份条款70岁能不能买？",
+    "expect": ["document_qa"]
+  },
+  {
+    "id": "document_exclusion",
+    "query": "这份条款高血压是否免责？",
+    "expect": ["document_qa", "exclusion"]
+  }
+]

@@ -59,6 +59,18 @@ class GraphRetriever:
         except Exception as exc:
             return {"connected": False, "labels": {}, "relationships": 0, "error": str(exc)}
 
+    def _path_cards_from_strings(self, paths: list) -> list:
+        cards = []
+        for idx, path in enumerate(paths[:8], start=1):
+            parts = [part.strip() for part in str(path).split("->") if part.strip()]
+            cards.append({
+                "title": f"证据路径 {idx}",
+                "path": parts or [str(path)],
+                "evidence": str(path),
+                "score": round(max(0.52, 0.92 - idx * 0.04), 2),
+            })
+        return cards
+
     def get_subgraph(self, entity: str = "", query: str = "", depth: int = 1, limit: int = 40) -> dict:
         if not self.driver:
             return {"nodes": [], "edges": [], "paths": [], "message": "Database connection unavailable."}
@@ -108,7 +120,12 @@ class GraphRetriever:
                 if len(names) >= 2:
                     paths.append(" -> ".join(names))
 
-        return {"nodes": list(nodes.values()), "edges": list(edges.values()), "paths": paths[:10]}
+        return {
+            "nodes": list(nodes.values()),
+            "edges": list(edges.values()),
+            "paths": paths[:10],
+            "reasoning_paths": self._path_cards_from_strings(paths),
+        }
 
     def _fallback_keyword_sources(self, raw_query: str, limit: int = 5) -> list:
         """Lightweight lexical recall used as a CPU-only HybridRAG fallback."""
@@ -141,9 +158,53 @@ class GraphRetriever:
                     "name": r["name"],
                     "snippet": (r["text"] or "")[:160],
                     "score": 0.62,
+                    "rule_score": 0.45,
+                    "graph_score": 0.0,
+                    "vector_score": 0.0,
+                    "hybrid_score": 0.09,
                 }
                 for r in rows
             ]
+
+    def _normalize_source_scores(self, source: dict, graph_score: float = 0.0, vector_score: float = 0.0, rule_score: float = 0.0) -> dict:
+        source = dict(source)
+        source["graph_score"] = round(float(source.get("graph_score", graph_score) or 0.0), 4)
+        source["vector_score"] = round(float(source.get("vector_score", vector_score) or 0.0), 4)
+        source["rule_score"] = round(float(source.get("rule_score", rule_score) or 0.0), 4)
+        source["hybrid_score"] = round(
+            0.45 * source["graph_score"] + 0.35 * source["vector_score"] + 0.20 * source["rule_score"],
+            4,
+        )
+        source["score"] = source.get("hybrid_score") or source.get("score") or 0.0
+        return source
+
+    def _build_reasoning_paths(self, parsed_query: dict, payload: dict) -> list:
+        age = parsed_query.get("age")
+        diseases = parsed_query.get("disease") or []
+        if isinstance(diseases, str):
+            diseases = [diseases]
+        city = normalize_city(parsed_query.get("city"))
+        price_max = parsed_query.get("price_max")
+        paths = []
+        for item in (payload.get("recommendations", {}).get("insurance") or [])[:5]:
+            seed = diseases[0] if diseases else (f"{age}岁用户" if age else "用户画像")
+            paths.append({
+                "title": item.get("name", "保险候选"),
+                "path": [seed, "年龄/险种硬规则过滤", item.get("name", "保险候选")],
+                "evidence": item.get("suitable_reason", ""),
+                "score": item.get("score"),
+            })
+        for item in (payload.get("recommendations", {}).get("nursing_homes") or [])[:5]:
+            seed = " / ".join(str(x) for x in [city, f"{price_max}元以内" if price_max else None] if x) or "养老需求"
+            paths.append({
+                "title": item.get("name", "养老机构候选"),
+                "path": [seed, "城市/预算/服务能力过滤", item.get("name", "养老机构候选")],
+                "evidence": f"{item.get('address', '')} {item.get('services', '')}"[:160],
+                "score": item.get("score"),
+            })
+        if not paths:
+            paths = self._path_cards_from_strings(payload.get("graph", {}).get("paths", []))
+        return paths[:8]
 
     def retrieve_structured(self, parsed_query: dict) -> dict:
         context = self.retrieve(parsed_query)
@@ -155,15 +216,28 @@ class GraphRetriever:
 
         raw_query = parsed_query.get("raw_query", "")
         existing = {(s.get("label"), s.get("name")) for s in payload["sources"]}
+        payload["sources"] = [
+            self._normalize_source_scores(
+                src,
+                graph_score=float(src.get("score", 0.75) or 0.75),
+                rule_score=0.65 if src.get("label") in {"Insurance", "NursingHome"} else 0.35,
+            )
+            for src in payload["sources"]
+        ]
         for src in self.vector_index.search(raw_query, top_k=5):
             key = (src.get("label"), src.get("name"))
             if key not in existing:
-                payload["sources"].append(src)
+                payload["sources"].append(self._normalize_source_scores(src))
                 existing.add(key)
         for src in self._fallback_keyword_sources(raw_query):
             key = (src.get("label"), src.get("name"))
             if key not in existing:
-                payload["sources"].append(src)
+                payload["sources"].append(self._normalize_source_scores(src, rule_score=0.45))
+                existing.add(key)
+        payload["sources"].sort(key=lambda item: item.get("hybrid_score", item.get("score", 0)), reverse=True)
+        payload["sources"] = payload["sources"][:14]
+        payload["reasoning_paths"] = self._build_reasoning_paths(parsed_query, payload)
+        payload["graph"]["reasoning_paths"] = payload["reasoning_paths"]
 
         return payload
 

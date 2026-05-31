@@ -1,3 +1,4 @@
+import time
 from typing import List, Dict, Optional
 from src.utils.logger import logger
 from src.graph_rag.query_understanding import QueryParser
@@ -12,6 +13,40 @@ class RAGEngine:
         self.llm = LLMIntegration()
         self._response_cache = {}
         self._response_cache_order = []
+        self._metrics = {
+            "total_queries": 0,
+            "cache_hits": 0,
+            "total_latency_ms": 0.0,
+            "graph_hits": 0,
+            "rule_filter_hits": 0,
+            "last_eval": None,
+        }
+
+    def _record_metrics(self, result: dict, latency_ms: float, cache_hit: bool = False) -> None:
+        self._metrics["total_queries"] += 1
+        self._metrics["total_latency_ms"] += latency_ms
+        if cache_hit:
+            self._metrics["cache_hits"] += 1
+        if result.get("graph", {}).get("nodes"):
+            self._metrics["graph_hits"] += 1
+        recs = result.get("recommendations", {}) or {}
+        if recs.get("insurance") or recs.get("nursing_homes"):
+            self._metrics["rule_filter_hits"] += 1
+
+    def get_metrics(self) -> dict:
+        total = max(1, self._metrics["total_queries"])
+        return {
+            "total_queries": self._metrics["total_queries"],
+            "cache_hits": self._metrics["cache_hits"],
+            "cache_hit_rate": round(self._metrics["cache_hits"] / total, 4),
+            "avg_latency_ms": round(self._metrics["total_latency_ms"] / total, 2),
+            "graph_hit_rate": round(self._metrics["graph_hits"] / total, 4),
+            "rule_filter_hits": self._metrics["rule_filter_hits"],
+            "last_eval": self._metrics.get("last_eval"),
+        }
+
+    def update_last_eval(self, summary: dict) -> None:
+        self._metrics["last_eval"] = summary
 
     # === 新增函数：独立的问题重写模块 ===
     def _rewrite_query(self, user_query: str, history: List[Dict[str, str]], trace: Optional[list] = None) -> str:
@@ -92,6 +127,7 @@ class RAGEngine:
 
     # === 修改 chat 函数，接收 history 参数 ===
     def chat(self, user_query: str, history: Optional[List[Dict[str, str]]] = None) -> dict:
+        started = time.perf_counter()
         history = history or []
         cache_key = user_query.strip()
         if not history and cache_key in self._response_cache:
@@ -106,6 +142,7 @@ class RAGEngine:
                 },
                 *cached.get("trace", []),
             ]
+            self._record_metrics(cached, (time.perf_counter() - started) * 1000, cache_hit=True)
             return cached
         trace = []
         
@@ -167,6 +204,7 @@ class RAGEngine:
                 "sources": [],
                 "graph": {"nodes": [], "edges": [], "paths": []},
                 "recommendations": {"insurance": [], "nursing_homes": []},
+                "reasoning_paths": [],
             }
             trace.append({
                 "agent": "RetrieverAgent",
@@ -300,6 +338,7 @@ class RAGEngine:
             "graph": retrieval_payload.get("graph", {"nodes": [], "edges": [], "paths": []}),
             "recommendations": retrieval_payload.get("recommendations", {"insurance": [], "nursing_homes": []}),
             "trace": trace,
+            "reasoning_paths": retrieval_payload.get("reasoning_paths", []),
         }
         if not history and cache_key:
             self._response_cache[cache_key] = result
@@ -307,6 +346,7 @@ class RAGEngine:
             if len(self._response_cache_order) > 64:
                 oldest = self._response_cache_order.pop(0)
                 self._response_cache.pop(oldest, None)
+        self._record_metrics(result, (time.perf_counter() - started) * 1000)
         return result
 
     def close(self):

@@ -71,6 +71,23 @@ python scripts/check_runtime.py
 - `/health` 改为轻量健康检查，不再每次阻塞式访问 Neo4j。
 - Neo4j driver 设置连接超时与连接池上限，避免数据库异常时拖慢整个页面。
 
+## 第二阶段增强功能
+
+- 流式问答接口：`POST /chat/stream`，前端会优先使用 SSE 展示 Agent 执行轨迹和打字机式回答；失败时自动回退 `POST /chat`。
+- 性能指标接口：`GET /metrics/demo`，展示平均延迟、缓存命中率、图谱命中率、规则过滤次数和图谱连接状态。
+- 资料解析工作台：上传 PDF/txt 后可抽取三元组，先 `dry-run` 校验，再确认写入 Neo4j。
+- StepChain 证据路径：每轮回答在图谱证据图下展示“用户条件 -> 规则过滤 -> 推荐实体”的可解释路径。
+- 评测脚本：
+
+```bash
+source .venv/bin/activate
+python scripts/eval_demo.py --api-root http://127.0.0.1:8000
+```
+
+评测报告会生成到 `reports/`，该目录是本地产物，已加入 `.gitignore`。
+
+可选：如果后续要启用真正的本地 embedding 模型，可以在服务器或 WSL 安装 `sentence-transformers` 并下载 `BAAI/bge-small-zh-v1.5`。当前代码保留轻量字符向量兜底，不会阻塞演示。
+
 本地 Neo4j Desktop 推荐 `.env`：
 
 ```env
