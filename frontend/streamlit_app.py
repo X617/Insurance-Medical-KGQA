@@ -1,8 +1,8 @@
 import base64
 import html
 import json
-import math
 import os
+import uuid
 from typing import Any, Dict, List
 
 import requests
@@ -155,8 +155,8 @@ def get_graph_stats() -> Dict[str, str]:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def cached_subgraph(seed: str, depth: int) -> Dict[str, Any]:
-    return api_get("/graph/subgraph", query=seed, depth=depth, limit=50, timeout=6.0)
+def cached_subgraph(seed: str, depth: int, limit: int) -> Dict[str, Any]:
+    return api_get("/graph/subgraph", query=seed, depth=depth, limit=limit, timeout=10.0)
 
 
 def render_metric(label: str, value: str) -> None:
@@ -184,68 +184,316 @@ def label_color(label: str) -> str:
     }.get(label, "#64748b")
 
 
-def render_graph(graph: Dict[str, Any], height: int = 320) -> None:
-    nodes = (graph.get("nodes") or [])[:28]
+def render_graph(graph: Dict[str, Any], height: int = 420, max_nodes: int = 72, max_edges: int = 140) -> None:
+    nodes = (graph.get("nodes") or [])[:max_nodes]
     node_ids = {node["id"] for node in nodes}
     edges = [
         edge for edge in (graph.get("edges") or [])
         if edge.get("source") in node_ids and edge.get("target") in node_ids
-    ][:48]
+    ][:max_edges]
     if not nodes:
         st.info("本轮没有可视化子图。可以换一个包含疾病、保险或养老院实体的问题。")
         return
 
-    width = 940
-    cx, cy = width / 2, height / 2
-    radius = max(105, min(width, height) * 0.36)
-    positions = {}
-    for idx, node in enumerate(nodes):
-        angle = 2 * math.pi * idx / max(1, len(nodes))
-        positions[node["id"]] = (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
-
-    edge_svg = []
-    for edge in edges:
-        if edge["source"] not in positions or edge["target"] not in positions:
-            continue
-        x1, y1 = positions[edge["source"]]
-        x2, y2 = positions[edge["target"]]
-        edge_svg.append(
-            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
-            f'stroke="#94a3b8" stroke-width="1.8"><title>{html.escape(edge.get("type", ""))}</title></line>'
-        )
-
-    node_svg = []
-    for node in nodes:
-        x, y = positions[node["id"]]
-        name = str(node.get("name") or node.get("label") or "")[:14]
-        label = node.get("label", "Entity")
-        color = label_color(label)
-        node_svg.append(
-            f"""
-<g class="node">
-  <circle cx="{x:.1f}" cy="{y:.1f}" r="28" fill="{color}" opacity="0.92">
-    <title>{html.escape(label)}: {html.escape(str(node.get("name", "")))}</title>
-  </circle>
-  <text x="{x:.1f}" y="{y + 43:.1f}" text-anchor="middle" font-size="12" fill="#111827">{html.escape(name)}</text>
-</g>
-"""
-        )
-
-    legend_items = "".join(
-        f'<span style="margin-right:14px;"><b style="color:{label_color(label)};">●</b> {label}</span>'
-        for label in sorted({n.get("label", "Entity") for n in nodes})
-    )
-    svg = f"""
-<div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px;">
-  <div style="font:13px sans-serif;color:#475569;margin:2px 0 8px 4px;">{legend_items}</div>
-  <svg viewBox="0 0 {width} {height}" width="100%" height="{height}" role="img">
-    <rect x="0" y="0" width="{width}" height="{height}" fill="#fbfdff"/>
-    {''.join(edge_svg)}
-    {''.join(node_svg)}
-  </svg>
+    color_map = {label: label_color(label) for label in sorted({n.get("label", "Entity") for n in nodes})}
+    safe_nodes = [
+        {
+            "id": str(node.get("id")),
+            "label": str(node.get("label", "Entity")),
+            "name": str(node.get("name") or node.get("label") or "Entity"),
+            "degree": int(node.get("degree") or 0),
+            "seed": bool(node.get("seed")),
+            "size": int(node.get("size") or 16),
+        }
+        for node in nodes
+    ]
+    safe_edges = [
+        {
+            "id": str(edge.get("id") or idx),
+            "source": str(edge.get("source")),
+            "target": str(edge.get("target")),
+            "type": str(edge.get("type", "")),
+        }
+        for idx, edge in enumerate(edges)
+    ]
+    component_id = f"kg_{uuid.uuid4().hex}"
+    payload = json.dumps(
+        {"nodes": safe_nodes, "edges": safe_edges, "colors": color_map},
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
+    graph_html = """
+<div id="__ID__" class="kg-wrap">
+  <div class="kg-topbar">
+    <div class="kg-title">交互式知识图谱</div>
+    <div class="kg-meta">拖动节点整理布局 · 滚轮缩放 · 拖动画布平移 · 双击节点聚焦</div>
+    <button class="kg-reset" type="button">重置视图</button>
+  </div>
+  <div class="kg-legend"></div>
+  <svg class="kg-svg" width="100%" height="__HEIGHT__" role="img"></svg>
+  <div class="kg-tip"></div>
 </div>
+<style>
+  #__ID__.kg-wrap {
+    background: #fff;
+    border: 1px solid #dbe3ef;
+    border-radius: 8px;
+    padding: 12px;
+    font-family: Inter, "Microsoft YaHei", Arial, sans-serif;
+  }
+  #__ID__ .kg-topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+  #__ID__ .kg-title { font-weight: 780; color: #172033; }
+  #__ID__ .kg-meta { flex: 1; color: #64748b; font-size: 12px; }
+  #__ID__ .kg-reset {
+    border: 1px solid #dbe3ef;
+    background: #f8fafc;
+    color: #334155;
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  #__ID__ .kg-legend { color: #475569; font-size: 12px; margin-bottom: 8px; }
+  #__ID__ .kg-legend span { margin-right: 14px; white-space: nowrap; }
+  #__ID__ .kg-svg {
+    border-radius: 8px;
+    background:
+      radial-gradient(circle at 50% 50%, rgba(37,99,235,.08), transparent 32%),
+      linear-gradient(180deg, #fbfdff 0%, #f8fafc 100%);
+    cursor: grab;
+  }
+  #__ID__ .kg-svg:active { cursor: grabbing; }
+  #__ID__ .edge { stroke: #94a3b8; stroke-opacity: .62; }
+  #__ID__ .edge-label { fill: #64748b; font-size: 10px; opacity: .78; pointer-events: none; }
+  #__ID__ .node circle { stroke: #fff; stroke-width: 2.2px; filter: drop-shadow(0 4px 10px rgba(15,23,42,.16)); }
+  #__ID__ .node.seed circle { stroke: #111827; stroke-width: 3px; }
+  #__ID__ .node text { fill: #111827; font-size: 11px; text-anchor: middle; pointer-events: none; paint-order: stroke; stroke: #fff; stroke-width: 3px; }
+  #__ID__ .kg-tip {
+    margin-top: 8px;
+    min-height: 22px;
+    color: #475569;
+    font-size: 12px;
+  }
+</style>
+<script>
+(function() {
+  const root = document.getElementById("__ID__");
+  const data = __DATA__;
+  const svg = root.querySelector(".kg-svg");
+  const legend = root.querySelector(".kg-legend");
+  const tip = root.querySelector(".kg-tip");
+  const width = svg.clientWidth || 960;
+  const height = __HEIGHT__;
+  const colors = data.colors || {};
+  const nodes = data.nodes.map((d, i) => ({
+    ...d,
+    x: width / 2 + (Math.random() - 0.5) * width * 0.35,
+    y: height / 2 + (Math.random() - 0.5) * height * 0.35,
+    vx: 0,
+    vy: 0,
+    fixed: false,
+    r: Math.max(11, Math.min(32, Number(d.size || 16)))
+  }));
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const edges = data.edges
+    .map(e => ({...e, sourceNode: byId.get(e.source), targetNode: byId.get(e.target)}))
+    .filter(e => e.sourceNode && e.targetNode);
+
+  legend.innerHTML = Object.keys(colors).map(label =>
+    `<span><b style="color:${colors[label]}">●</b> ${label}</span>`
+  ).join("");
+
+  const ns = "http://www.w3.org/2000/svg";
+  const viewport = document.createElementNS(ns, "g");
+  svg.appendChild(viewport);
+  const edgeLayer = document.createElementNS(ns, "g");
+  const labelLayer = document.createElementNS(ns, "g");
+  const nodeLayer = document.createElementNS(ns, "g");
+  viewport.appendChild(edgeLayer);
+  viewport.appendChild(labelLayer);
+  viewport.appendChild(nodeLayer);
+
+  const edgeEls = edges.map(e => {
+    const line = document.createElementNS(ns, "line");
+    line.setAttribute("class", "edge");
+    line.setAttribute("stroke-width", Math.max(1.2, Math.min(2.8, 1.2 + (e.sourceNode.degree + e.targetNode.degree) / 18)));
+    edgeLayer.appendChild(line);
+    return line;
+  });
+  const edgeLabelEls = edges.slice(0, 36).map(e => {
+    const text = document.createElementNS(ns, "text");
+    text.setAttribute("class", "edge-label");
+    text.textContent = e.type.length > 18 ? e.type.slice(0, 18) : e.type;
+    labelLayer.appendChild(text);
+    return text;
+  });
+  const nodeEls = nodes.map(n => {
+    const g = document.createElementNS(ns, "g");
+    g.setAttribute("class", `node ${n.seed ? "seed" : ""}`);
+    const circle = document.createElementNS(ns, "circle");
+    circle.setAttribute("r", n.r);
+    circle.setAttribute("fill", colors[n.label] || "#64748b");
+    const text = document.createElementNS(ns, "text");
+    text.setAttribute("y", n.r + 15);
+    text.textContent = n.name.length > 13 ? n.name.slice(0, 12) + "…" : n.name;
+    g.appendChild(circle);
+    g.appendChild(text);
+    nodeLayer.appendChild(g);
+
+    g.addEventListener("pointerdown", ev => {
+      ev.stopPropagation();
+      n.fixed = true;
+      g.setPointerCapture(ev.pointerId);
+      const start = toLocal(ev);
+      const ox = n.x - start.x;
+      const oy = n.y - start.y;
+      function move(evt) {
+        const p = toLocal(evt);
+        n.x = p.x + ox;
+        n.y = p.y + oy;
+        draw();
+      }
+      function up(evt) {
+        g.releasePointerCapture(evt.pointerId);
+        g.removeEventListener("pointermove", move);
+        g.removeEventListener("pointerup", up);
+      }
+      g.addEventListener("pointermove", move);
+      g.addEventListener("pointerup", up);
+    });
+    g.addEventListener("mouseenter", () => {
+      tip.textContent = `${n.label} · ${n.name} · degree=${n.degree}`;
+    });
+    g.addEventListener("dblclick", () => {
+      transform.x = width / 2 - n.x * transform.k;
+      transform.y = height / 2 - n.y * transform.k;
+      draw();
+    });
+    return g;
+  });
+
+  let transform = {x: 0, y: 0, k: 1};
+  function toLocal(ev) {
+    const rect = svg.getBoundingClientRect();
+    return {
+      x: (ev.clientX - rect.left - transform.x) / transform.k,
+      y: (ev.clientY - rect.top - transform.y) / transform.k
+    };
+  }
+  svg.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const oldK = transform.k;
+    const nextK = Math.max(0.35, Math.min(2.8, oldK * (ev.deltaY < 0 ? 1.1 : 0.9)));
+    const rect = svg.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    transform.x = mx - (mx - transform.x) * nextK / oldK;
+    transform.y = my - (my - transform.y) * nextK / oldK;
+    transform.k = nextK;
+    draw();
+  }, {passive: false});
+  svg.addEventListener("pointerdown", ev => {
+    const sx = ev.clientX, sy = ev.clientY, ox = transform.x, oy = transform.y;
+    svg.setPointerCapture(ev.pointerId);
+    function move(evt) {
+      transform.x = ox + evt.clientX - sx;
+      transform.y = oy + evt.clientY - sy;
+      draw();
+    }
+    function up(evt) {
+      svg.releasePointerCapture(evt.pointerId);
+      svg.removeEventListener("pointermove", move);
+      svg.removeEventListener("pointerup", up);
+    }
+    svg.addEventListener("pointermove", move);
+    svg.addEventListener("pointerup", up);
+  });
+  root.querySelector(".kg-reset").addEventListener("click", () => {
+    transform = {x: 0, y: 0, k: 1};
+    nodes.forEach(n => n.fixed = false);
+    tick(120);
+    draw();
+  });
+
+  const labelBuckets = {};
+  nodes.forEach(n => {
+    if (!labelBuckets[n.label]) labelBuckets[n.label] = Object.keys(labelBuckets).length;
+  });
+  function tick(iterations) {
+    const area = Math.max(width * height, 1);
+    const charge = Math.sqrt(area / Math.max(nodes.length, 1)) * 1.65;
+    for (let t = 0; t < iterations; t++) {
+      edges.forEach(e => {
+        const a = e.sourceNode, b = e.targetNode;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const ideal = 92 + Math.min(90, (a.r + b.r) * 1.8);
+        const force = (dist - ideal) * 0.012;
+        const fx = dx / dist * force, fy = dy / dist * force;
+        if (!a.fixed) { a.vx += fx; a.vy += fy; }
+        if (!b.fixed) { b.vx -= fx; b.vy -= fy; }
+      });
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const dist2 = dx * dx + dy * dy + 0.01;
+          const dist = Math.sqrt(dist2);
+          const minDist = a.r + b.r + 10;
+          const repel = Math.min(2.2, charge * charge / dist2);
+          const overlap = dist < minDist ? (minDist - dist) * 0.08 : 0;
+          const fx = dx / dist * (repel + overlap);
+          const fy = dy / dist * (repel + overlap);
+          if (!a.fixed) { a.vx -= fx; a.vy -= fy; }
+          if (!b.fixed) { b.vx += fx; b.vy += fy; }
+        }
+      }
+      nodes.forEach(n => {
+        const bucket = labelBuckets[n.label] || 0;
+        const lanes = Math.max(1, Object.keys(labelBuckets).length);
+        const targetX = n.seed ? width * 0.5 : width * (0.18 + 0.64 * (bucket + 0.5) / lanes);
+        const targetY = n.seed ? height * 0.5 : height * 0.5;
+        if (!n.fixed) {
+          n.vx += (targetX - n.x) * (n.seed ? 0.035 : 0.006);
+          n.vy += (targetY - n.y) * (n.seed ? 0.035 : 0.006);
+          n.vx *= 0.82;
+          n.vy *= 0.82;
+          n.x = Math.max(40, Math.min(width - 40, n.x + n.vx));
+          n.y = Math.max(40, Math.min(height - 52, n.y + n.vy));
+        }
+      });
+    }
+  }
+  function draw() {
+    viewport.setAttribute("transform", `translate(${transform.x},${transform.y}) scale(${transform.k})`);
+    edges.forEach((e, i) => {
+      edgeEls[i].setAttribute("x1", e.sourceNode.x);
+      edgeEls[i].setAttribute("y1", e.sourceNode.y);
+      edgeEls[i].setAttribute("x2", e.targetNode.x);
+      edgeEls[i].setAttribute("y2", e.targetNode.y);
+      if (edgeLabelEls[i]) {
+        edgeLabelEls[i].setAttribute("x", (e.sourceNode.x + e.targetNode.x) / 2);
+        edgeLabelEls[i].setAttribute("y", (e.sourceNode.y + e.targetNode.y) / 2 - 4);
+      }
+    });
+    nodes.forEach((n, i) => nodeEls[i].setAttribute("transform", `translate(${n.x},${n.y})`));
+  }
+  tick(220);
+  draw();
+  tip.textContent = `当前子图：${nodes.length} 个节点，${edges.length} 条关系。`;
+})();
+</script>
 """
-    components.html(svg, height=height + 56, scrolling=False)
+    graph_html = (
+        graph_html
+        .replace("__ID__", component_id)
+        .replace("__HEIGHT__", str(height))
+        .replace("__DATA__", payload)
+    )
+    components.html(graph_html, height=height + 92, scrolling=False)
 
 
 def render_recommendations(recommendations: Dict[str, Any]) -> None:
@@ -774,14 +1022,59 @@ with tab_upload:
 
 with tab_graph:
     st.markdown("### 图谱子图探索")
-    seed = st.text_input("输入实体或问题关键词", value="高血压")
-    depth = st.slider("探索深度", 1, 2, 1)
-    if st.button("加载子图", use_container_width=True):
-        st.session_state.explore_graph = cached_subgraph(seed, depth)
+    st.caption("面向答辩展示的交互式子图工作台：支持更深层关系扩展、拖拽节点、滚轮缩放和证据路径查看。")
+    col_query, col_depth, col_limit = st.columns([4, 1.4, 1.6])
+    with col_query:
+        seed = st.text_input("输入实体或问题关键词", value="高血压")
+    with col_depth:
+        depth = st.slider("探索深度", 1, 4, 2)
+    with col_limit:
+        limit = st.slider("路径上限", 20, 180, 90, step=10)
+    if st.button("加载交互式子图", use_container_width=True):
+        st.session_state.explore_graph = cached_subgraph(seed, depth, limit)
     if st.session_state.get("explore_graph"):
         graph = st.session_state.explore_graph
-        render_graph(graph, height=360)
-        st.json({"nodes": len(graph.get("nodes", [])), "edges": len(graph.get("edges", [])), "paths": graph.get("paths", [])[:8]})
+        meta = graph.get("meta", {})
+        count_cols = st.columns(4)
+        with count_cols[0]:
+            render_metric("节点", str(meta.get("node_count", len(graph.get("nodes", [])))))
+        with count_cols[1]:
+            render_metric("关系", str(meta.get("edge_count", len(graph.get("edges", [])))))
+        with count_cols[2]:
+            render_metric("深度", str(meta.get("depth", depth)))
+        with count_cols[3]:
+            render_metric("种子实体", str(meta.get("start_count", "-")))
+        render_graph(graph, height=520, max_nodes=95, max_edges=180)
+
+        path_col, node_col = st.columns([1.1, 1])
+        with path_col:
+            st.markdown("**证据路径预览**")
+            paths = graph.get("paths", [])[:12]
+            if paths:
+                for path in paths:
+                    st.markdown(f'<div class="source-line">{html.escape(str(path))}</div>', unsafe_allow_html=True)
+            else:
+                st.info("暂无路径信息。")
+        with node_col:
+            st.markdown("**高连接节点**")
+            top_nodes = sorted(
+                graph.get("nodes", []),
+                key=lambda item: item.get("degree", 0),
+                reverse=True,
+            )[:12]
+            st.dataframe(
+                [
+                    {
+                        "类型": item.get("label"),
+                        "名称": item.get("name"),
+                        "度数": item.get("degree", 0),
+                        "种子": "是" if item.get("seed") else "",
+                    }
+                    for item in top_nodes
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 with tab_metrics:
     metrics_panel()

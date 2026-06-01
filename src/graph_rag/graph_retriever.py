@@ -79,8 +79,8 @@ class GraphRetriever:
         if not seed:
             return {"nodes": [], "edges": [], "paths": [], "message": "Missing entity or query."}
 
-        depth = max(1, min(int(depth or 1), 2))
-        limit = max(5, min(int(limit or 40), 80))
+        depth = max(1, min(int(depth or 1), 4))
+        limit = max(8, min(int(limit or 40), 180))
         cypher = f"""
         MATCH (start)
         WHERE start.name CONTAINS $seed OR $seed CONTAINS start.name
@@ -93,12 +93,15 @@ class GraphRetriever:
         nodes = {}
         edges = {}
         paths = []
+        start_ids = set()
         with self.driver.session(database=self.database) as session:
             for row in session.run(cypher, seed=seed, limit=limit):
                 path = row["path"]
                 names = []
-                for node in path.nodes:
+                for idx, node in enumerate(path.nodes):
                     node_id = str(node.element_id)
+                    if idx == 0:
+                        start_ids.add(node_id)
                     props = dict(node)
                     label = next(iter(node.labels), "Entity")
                     nodes[node_id] = {
@@ -106,6 +109,7 @@ class GraphRetriever:
                         "label": label,
                         "name": props.get("name", node_id),
                         "properties": props,
+                        "seed": node_id in start_ids,
                     }
                     names.append(props.get("name", label))
                 for rel in path.relationships:
@@ -120,11 +124,27 @@ class GraphRetriever:
                 if len(names) >= 2:
                     paths.append(" -> ".join(names))
 
+        degree = {node_id: 0 for node_id in nodes}
+        for edge in edges.values():
+            degree[edge["source"]] = degree.get(edge["source"], 0) + 1
+            degree[edge["target"]] = degree.get(edge["target"], 0) + 1
+        for node_id, node in nodes.items():
+            node["degree"] = degree.get(node_id, 0)
+            node["size"] = min(34, 12 + node["degree"] * 2 + (8 if node.get("seed") else 0))
+
         return {
-            "nodes": list(nodes.values()),
+            "nodes": sorted(nodes.values(), key=lambda item: (not item.get("seed"), -item.get("degree", 0), item.get("name", ""))),
             "edges": list(edges.values()),
             "paths": paths[:10],
             "reasoning_paths": self._path_cards_from_strings(paths),
+            "meta": {
+                "seed": seed,
+                "depth": depth,
+                "limit": limit,
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+                "start_count": len(start_ids),
+            },
         }
 
     def _fallback_keyword_sources(self, raw_query: str, limit: int = 5) -> list:
