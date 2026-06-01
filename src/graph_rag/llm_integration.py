@@ -183,7 +183,7 @@
 
 
 import os  # <--- 新增：引入系统模块
-from typing import List, Dict, Any, Optional, Generator
+from typing import Any, Dict, List, Optional, Generator
 from src.utils.config_loader import config
 from src.utils.logger import logger
 from dotenv import load_dotenv # <--- 新增：确保加载 .env
@@ -204,9 +204,9 @@ class LLMIntegration:
             or llm_conf.get("model_name", "deepseek-v4-pro")
         )
         self.api_base = (
-            llm_conf.get("api_base")
-            or os.getenv("DEEPSEEK_BASE_URL")
+            os.getenv("DEEPSEEK_BASE_URL")
             or os.getenv("OPENAI_BASE_URL")
+            or llm_conf.get("api_base")
         )
         
         # config.yaml → 环境变量（支持 DeepSeek / 百炼兼容 / OpenAI 风格）
@@ -217,13 +217,23 @@ class LLMIntegration:
             or os.getenv("OPENAI_API_KEY")
         )
         
-        # 同样的逻辑也可以用于 Neo4j 密码（虽然这里只处理 LLM）
+        if self.api_base and "api.deepseek.com" in self.api_base:
+            self.api_base = self.api_base.rstrip("/")
+            if self.api_base.endswith("/v1"):
+                self.api_base = self.api_base[:-3]
+
+        self.reasoning_effort = os.getenv("DEEPSEEK_REASONING_EFFORT", "medium")
+        self.fallback_model = os.getenv("DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-flash")
+        self.pro_min_tokens = int(os.getenv("DEEPSEEK_PRO_MIN_TOKENS", "2048"))
+        self.timeout_seconds = float(os.getenv("DEEPSEEK_TIMEOUT", "90"))
+        self.last_model_used = self.model_name
+        self.last_error = ""
         
         self._client = None
         
         # 调试日志：只打印前几位，防止泄露
-        masked_key = (self.api_key[:8] + "...") if self.api_key else "未找到!"
-        logger.info(f"LLM Init: Model={self.model_name}, Key={masked_key}")
+        masked_key = (self.api_key[:4] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 10 else "未找到!"
+        logger.info(f"LLM Init: Model={self.model_name}, BaseURL={self.api_base}, Key={masked_key}")
 
     # ... (后面的代码 _get_client, chat, generate 等保持不变) ...
     def _get_client(self):
@@ -237,7 +247,7 @@ class LLMIntegration:
             self._client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
-                timeout=20.0,
+                timeout=self.timeout_seconds,
                 max_retries=0,
             )
             return self._client
@@ -246,20 +256,72 @@ class LLMIntegration:
             raise
     
     # 下面的 chat 和 generate 函数直接复用之前的即可，不用改
+    def _with_deepseek_v4_params(self, kwargs: Dict[str, Any], model_name: Optional[str] = None) -> Dict[str, Any]:
+        """DeepSeek V4 Pro requires explicit thinking params in OpenAI-compatible calls."""
+        params = dict(kwargs)
+        model = (model_name or self.model_name or "").lower()
+        if "deepseek-v4-pro" in model:
+            extra_body = dict(params.pop("extra_body", {}) or {})
+            extra_body.setdefault("thinking", {"type": "enabled"})
+            params["extra_body"] = extra_body
+            params.setdefault("reasoning_effort", self.reasoning_effort)
+        elif "deepseek-v4-flash" in model:
+            extra_body = dict(params.pop("extra_body", {}) or {})
+            extra_body.setdefault("thinking", {"type": "disabled"})
+            params["extra_body"] = extra_body
+        return params
+
+    def _completion(self, client, model_name: str, messages, temperature: float, max_tokens: Optional[int], kwargs: Dict[str, Any]):
+        request_kwargs = self._with_deepseek_v4_params(kwargs, model_name=model_name)
+        token_budget = max_tokens or 1024
+        if "deepseek-v4-pro" in (model_name or "").lower():
+            token_budget = max(token_budget, self.pro_min_tokens)
+        return client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=token_budget,
+            **request_kwargs,
+        )
+
+    def _message_content_or_raise(self, resp, model_name: str) -> str:
+        message = resp.choices[0].message
+        content = (message.content or "").strip()
+        if content:
+            return content
+        reasoning = getattr(message, "reasoning_content", None)
+        if reasoning:
+            raise RuntimeError(
+                f"{model_name} returned reasoning_content but empty final content; "
+                "increase max_tokens or use fallback model."
+            )
+        raise RuntimeError(f"{model_name} returned empty content.")
+
+    # 下面的 chat 和 generate 函数直接复用之前的即可，不用改
     def chat(self, messages, temperature=0.3, max_tokens=None, **kwargs):
         if self.model_type == "api":
             try:
                 client = self._get_client()
-                resp = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens or 1024,
-                    **kwargs,
-                )
-                return (resp.choices[0].message.content or "").strip()
+                resp = self._completion(client, self.model_name, messages, temperature, max_tokens, kwargs)
+                content = self._message_content_or_raise(resp, self.model_name)
+                self.last_model_used = self.model_name
+                self.last_error = ""
+                return content
             except Exception as e:
-                logger.error(f"调用大模型 API 失败: {e}")
+                self.last_error = str(e)
+                logger.error(f"调用大模型 API 失败: model={self.model_name}, error={repr(e)}")
+                fallback = (self.fallback_model or "").strip()
+                if fallback and fallback != self.model_name:
+                    try:
+                        logger.warning(f"主模型失败，自动降级到备用模型: {fallback}")
+                        resp = self._completion(client, fallback, messages, temperature, max_tokens, kwargs)
+                        content = self._message_content_or_raise(resp, fallback)
+                        self.last_model_used = fallback
+                        self.last_error = ""
+                        return content
+                    except Exception as fallback_exc:
+                        self.last_error = f"primary={e}; fallback={fallback_exc}"
+                        logger.error(f"备用模型调用也失败: model={fallback}, error={repr(fallback_exc)}")
                 return "抱歉，系统暂时无法生成回答 (LLM API Error)。"
         return "非 API 模式"
 

@@ -74,6 +74,7 @@ if [ "$FRONTEND_PORT" != "$REQUESTED_FRONTEND_PORT" ]; then
 fi
 
 export API_URL="http://${BACKEND_HOST}:${BACKEND_PORT}/chat"
+export BACKEND_URL="http://${BACKEND_HOST}:${BACKEND_PORT}"
 
 if [ "${NEO4J_PASSWORD:-}" = "your_neo4j_password" ] || [ "${DEEPSEEK_API_KEY:-}" = "sk-your-key" ]; then
   echo "注意：.env 仍包含模板占位值。页面可以启动，但完整问答需要填写真实 Neo4j 密码和 DeepSeek API Key。"

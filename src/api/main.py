@@ -295,6 +295,21 @@ async def health_check():
     return {"status": "ok", "neo4j_connected": neo4j_status, "llm_configured": llm_configured}
 
 
+@app.get("/llm/status")
+async def llm_status():
+    if not rag_engine or not rag_engine.llm:
+        raise HTTPException(status_code=503, detail="RAG engine is not ready")
+    llm = rag_engine.llm
+    return {
+        "configured": bool(llm.api_key),
+        "model": llm.model_name,
+        "fallback_model": getattr(llm, "fallback_model", ""),
+        "base_url": llm.api_base,
+        "last_model_used": getattr(llm, "last_model_used", ""),
+        "last_error": getattr(llm, "last_error", ""),
+    }
+
+
 @app.get("/graph/stats")
 async def graph_stats():
     if not rag_engine or not rag_engine.retriever:

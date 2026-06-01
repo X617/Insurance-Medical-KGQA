@@ -86,7 +86,35 @@ python scripts/eval_demo.py --api-root http://127.0.0.1:8000
 
 评测报告会生成到 `reports/`，该目录是本地产物，已加入 `.gitignore`。
 
-可选：如果后续要启用真正的本地 embedding 模型，可以在服务器或 WSL 安装 `sentence-transformers` 并下载 `BAAI/bge-small-zh-v1.5`。当前代码保留轻量字符向量兜底，不会阻塞演示。
+可选：启用真正的本地 embedding 模型，提升 HybridRAG 的语义召回质量。当前代码保留轻量字符向量兜底，如果模型下载或依赖安装失败，把 `KGQA_USE_EMBEDDINGS=0` 改回去即可，不会阻塞演示。
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-embedding.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+然后在 `.env` 中增加或修改：
+
+```env
+KGQA_USE_EMBEDDINGS=1
+KGQA_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+KGQA_EMBEDDING_DEVICE=cpu
+KGQA_EMBEDDING_CACHE=.cache/kgqa_bge_small_zh_v15.pkl
+```
+
+首次运行前建议先预热并生成本地缓存：
+
+```bash
+python scripts/build_embedding_index.py
+```
+
+首次下载模型可能需要几分钟，并占用数百 MB 磁盘空间；建好缓存后，后续启动会直接读取 `.cache/kgqa_bge_small_zh_v15.pkl`。如果输出里 `use_bge : True`，说明已经启用 BGE 语义索引。之后重启 demo：
+
+```bash
+bash scripts/run_demo.sh
+```
+
+在问答结果的“证据来源”里，如果看到 `bge_embedding` 或更高的 `hybrid` 分数，就说明语义向量召回已经参与排序。
 
 本地 Neo4j Desktop 推荐 `.env`：
 
@@ -99,7 +127,20 @@ NEO4J_DATABASE=kgqa
 DEEPSEEK_API_KEY=sk-你的真实Key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_REASONING_EFFORT=medium
+DEEPSEEK_FALLBACK_MODEL=deepseek-v4-flash
+DEEPSEEK_PRO_MIN_TOKENS=2048
+DEEPSEEK_TIMEOUT=90
+
+KGQA_USE_EMBEDDINGS=0
+KGQA_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+KGQA_EMBEDDING_DEVICE=cpu
+KGQA_EMBEDDING_CACHE=.cache/kgqa_bge_small_zh_v15.pkl
 ```
+
+如果使用 `deepseek-v4-pro`，后端会自动按 DeepSeek 官方示例附加 `thinking: enabled` 与 `reasoning_effort` 参数；`deepseek-v4-flash` 则默认关闭 thinking 以保持低延迟。
+如果主模型临时失败，系统会自动降级到 `DEEPSEEK_FALLBACK_MODEL`，避免演示现场直接中断。
+`v4-pro` 的 thinking 会占用输出 token 且响应更慢；如果 `max_tokens` 太小，可能只返回 `reasoning_content` 而没有最终 `content`。系统已设置 `DEEPSEEK_PRO_MIN_TOKENS` 和 `DEEPSEEK_TIMEOUT`，并在最终内容为空时自动降级。
 
 ## 当前核心链路
 

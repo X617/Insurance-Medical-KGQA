@@ -485,7 +485,7 @@ def request_chat_reply(prompt: str) -> Dict[str, Any]:
     ][-6:]
 
     try:
-        response = requests.post(CHAT_URL, json={"query": prompt, "history": history_payload}, timeout=(3, 25))
+        response = requests.post(CHAT_URL, json={"query": prompt, "history": history_payload}, timeout=(5, 150))
         if response.status_code == 200:
             data = response.json()
             return {
@@ -527,7 +527,7 @@ def iter_sse_chat(prompt: str):
     response = requests.post(
         STREAM_URL,
         json={"query": prompt, "history": history_payload},
-        timeout=(3, 45),
+        timeout=(5, 150),
         stream=True,
     )
     response.raise_for_status()

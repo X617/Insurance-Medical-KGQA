@@ -317,7 +317,7 @@ class RAGEngine:
                 "status": "ok",
                 "input": "context + recommendations + current_question",
                 "output": answer[:240],
-                "note": "基于检索上下文和结构化候选生成最终回答。",
+                "note": f"基于检索上下文和结构化候选生成最终回答。模型：{getattr(self.llm, 'last_model_used', 'unknown')}",
             })
         except Exception as e:
             logger.error(f"Generate failed: {e}")
@@ -340,7 +340,7 @@ class RAGEngine:
             "trace": trace,
             "reasoning_paths": retrieval_payload.get("reasoning_paths", []),
         }
-        if not history and cache_key:
+        if not history and cache_key and "LLM API Error" not in answer:
             self._response_cache[cache_key] = result
             self._response_cache_order.append(cache_key)
             if len(self._response_cache_order) > 64:
