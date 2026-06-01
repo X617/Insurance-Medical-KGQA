@@ -4,6 +4,7 @@ from src.utils.logger import logger
 from src.graph_rag.query_understanding import QueryParser
 from src.graph_rag.graph_retriever import GraphRetriever
 from src.graph_rag.llm_integration import LLMIntegration
+from src.graph_rag.theory_agents import TheoryAgents
 
 class RAGEngine:
     def __init__(self):
@@ -19,6 +20,12 @@ class RAGEngine:
             "total_latency_ms": 0.0,
             "graph_hits": 0,
             "rule_filter_hits": 0,
+            "confidence_total": 0.0,
+            "confidence_count": 0,
+            "hyde_hits": 0,
+            "drift_hits": 0,
+            "counterfactual_total": 0,
+            "counterfactual_passed": 0,
             "last_eval": None,
         }
 
@@ -32,9 +39,22 @@ class RAGEngine:
         recs = result.get("recommendations", {}) or {}
         if recs.get("insurance") or recs.get("nursing_homes"):
             self._metrics["rule_filter_hits"] += 1
+        confidence = result.get("confidence") or {}
+        if confidence.get("overall") is not None:
+            self._metrics["confidence_total"] += float(confidence.get("overall", 0.0))
+            self._metrics["confidence_count"] += 1
+        if result.get("hyde_query"):
+            self._metrics["hyde_hits"] += 1
+        if result.get("drift_queries"):
+            self._metrics["drift_hits"] += 1
+        checks = result.get("counterfactual_checks") or []
+        self._metrics["counterfactual_total"] += len(checks)
+        self._metrics["counterfactual_passed"] += sum(1 for item in checks if item.get("passed"))
 
     def get_metrics(self) -> dict:
         total = max(1, self._metrics["total_queries"])
+        confidence_count = max(1, self._metrics["confidence_count"])
+        cf_total = max(1, self._metrics["counterfactual_total"])
         return {
             "total_queries": self._metrics["total_queries"],
             "cache_hits": self._metrics["cache_hits"],
@@ -42,6 +62,10 @@ class RAGEngine:
             "avg_latency_ms": round(self._metrics["total_latency_ms"] / total, 2),
             "graph_hit_rate": round(self._metrics["graph_hits"] / total, 4),
             "rule_filter_hits": self._metrics["rule_filter_hits"],
+            "avg_confidence": round(self._metrics["confidence_total"] / confidence_count, 2),
+            "hyde_hits": self._metrics["hyde_hits"],
+            "drift_hits": self._metrics["drift_hits"],
+            "counterfactual_pass_rate": round(self._metrics["counterfactual_passed"] / cf_total, 4),
             "last_eval": self._metrics.get("last_eval"),
         }
 
@@ -159,6 +183,8 @@ class RAGEngine:
             parsed_intent = self.parser.parse(current_query)
             # ===【新增】把问题文本也塞进去，方便检索器做关键词匹配 ===
             parsed_intent['raw_query'] = current_query
+            hyde_query = TheoryAgents.build_hyde_query(current_query, parsed_intent)
+            parsed_intent["hyde_query"] = hyde_query
             logger.info(f"Parsed intent: {parsed_intent}")
             trace.append({
                 "agent": "IntentAgent",
@@ -167,9 +193,19 @@ class RAGEngine:
                 "output": parsed_intent,
                 "note": "抽取意图、年龄、疾病、城市、预算等结构化字段。",
             })
+            trace.append({
+                "agent": "HyDEAgent",
+                "status": "ok",
+                "input": current_query,
+                "output": hyde_query,
+                "note": "生成假设性专业检索扩展，用于提升语义召回覆盖面。",
+            })
         except Exception as e:
             logger.error(f"Intent parsing failed: {e}")
             parsed_intent = {}
+            hyde_query = TheoryAgents.build_hyde_query(current_query, parsed_intent)
+            parsed_intent["raw_query"] = current_query
+            parsed_intent["hyde_query"] = hyde_query
             trace.append({
                 "agent": "IntentAgent",
                 "status": "fallback",
@@ -181,6 +217,8 @@ class RAGEngine:
         # 3. 图谱检索（使用重写后的问题）
         try:
             retrieval_payload = self.retriever.retrieve_structured(parsed_intent)
+            drift_queries = TheoryAgents.build_drift_queries(current_query, parsed_intent, retrieval_payload)
+            retrieval_payload, drift_added = self.retriever.augment_with_drift(retrieval_payload, drift_queries)
             context = retrieval_payload["context"]
             recs = retrieval_payload.get("recommendations", {})
             trace.append({
@@ -196,9 +234,21 @@ class RAGEngine:
                 },
                 "note": "执行图谱召回、关键词语义兜底召回与规则重排。",
             })
+            trace.append({
+                "agent": "DriftAgent",
+                "status": "ok" if drift_queries else "skipped",
+                "input": current_query,
+                "output": {
+                    "drift_queries": drift_queries,
+                    "second_pass_added_sources": drift_added,
+                },
+                "note": "从初始证据生成局部追问，进行二次召回并融合排序。",
+            })
         except Exception as e:
             logger.error(f"Graph retrieval failed: {e}")
             context = "检索失败"
+            drift_queries = []
+            drift_added = 0
             retrieval_payload = {
                 "context": context,
                 "sources": [],
@@ -254,6 +304,18 @@ class RAGEngine:
                 "note": "单轮问题，使用图谱检索结果与硬规则过滤候选。",
             })
 
+        counterfactual_checks = TheoryAgents.counterfactual_checks(
+            parsed_intent,
+            retrieval_payload.get("recommendations", {}),
+        )
+        trace.append({
+            "agent": "CounterfactualAgent",
+            "status": "ok" if counterfactual_checks else "skipped",
+            "input": parsed_intent,
+            "output": counterfactual_checks,
+            "note": "对年龄、疾病或预算约束进行反事实合规检查，避免推荐在边界条件下失效。",
+        })
+
         # System Prompt 保持不变...
         system_prompt = """
        你是一名资深的保险与医养专家，服务于泰康保险集团。你的职责是利用提供的专业知识库（Context）来回答客户关于保险产品、疾病医疗和养老机构的问题。
@@ -303,6 +365,9 @@ class RAGEngine:
         [结构化候选推荐 - Recommendations]
         {retrieval_payload.get("recommendations", {})}
 
+        [反事实合规校验 - Counterfactual Checks]
+        {counterfactual_checks}
+
         [用户当前问题 - Current Question]
         {current_query}
 
@@ -329,6 +394,22 @@ class RAGEngine:
                 "output": answer,
                 "note": str(e),
             })
+        confidence = TheoryAgents.confidence_score(
+            retrieval_payload,
+            answer,
+            llm_error=getattr(self.llm, "last_error", ""),
+        )
+        trace.append({
+            "agent": "ConfidenceAgent",
+            "status": "ok",
+            "input": {
+                "sources": len(retrieval_payload.get("sources", [])),
+                "graph_nodes": len(retrieval_payload.get("graph", {}).get("nodes", [])),
+                "counterfactual_checks": len(counterfactual_checks),
+            },
+            "output": confidence,
+            "note": "融合图谱依据、语义匹配、规则合规和模型稳定性形成可信度评分。",
+        })
         result = {
             "answer": answer,
             "context": context,
@@ -339,6 +420,11 @@ class RAGEngine:
             "recommendations": retrieval_payload.get("recommendations", {"insurance": [], "nursing_homes": []}),
             "trace": trace,
             "reasoning_paths": retrieval_payload.get("reasoning_paths", []),
+            "confidence": confidence,
+            "hyde_query": hyde_query,
+            "drift_queries": drift_queries,
+            "counterfactual_checks": counterfactual_checks,
+            "retrieval_mode": "hybrid+hyde+drift" if drift_queries else "hybrid+hyde",
         }
         if not history and cache_key and "LLM API Error" not in answer:
             self._response_cache[cache_key] = result

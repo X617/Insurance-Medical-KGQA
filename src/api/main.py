@@ -14,6 +14,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from src.graph_rag.rag_engine import RAGEngine
+from src.graph_rag.theory_agents import TheoryAgents, estimate_ablation_rows
 from src.utils.logger import logger
 
 # === 修改点 1：定义请求模型，增加 history 字段 ===
@@ -34,6 +35,11 @@ class ChatResponse(BaseModel):
     recommendations: Dict[str, Any] = Field(default_factory=lambda: {"insurance": [], "nursing_homes": []})
     trace: List[Dict[str, Any]] = Field(default_factory=list)
     reasoning_paths: List[Dict[str, Any]] = Field(default_factory=list)
+    confidence: Dict[str, Any] = Field(default_factory=dict)
+    hyde_query: Optional[str] = None
+    drift_queries: List[str] = Field(default_factory=list)
+    counterfactual_checks: List[Dict[str, Any]] = Field(default_factory=list)
+    retrieval_mode: Optional[str] = None
 
 
 class DocumentUploadRequest(BaseModel):
@@ -232,6 +238,11 @@ async def chat_endpoint(request: ChatRequest):
             recommendations=result.get("recommendations", {"insurance": [], "nursing_homes": []}),
             trace=result.get("trace", []),
             reasoning_paths=result.get("reasoning_paths", []),
+            confidence=result.get("confidence", {}),
+            hyde_query=result.get("hyde_query"),
+            drift_queries=result.get("drift_queries", []),
+            counterfactual_checks=result.get("counterfactual_checks", []),
+            retrieval_mode=result.get("retrieval_mode"),
         )
     except Exception as e:
         logger.error(f"API Error: {e}")
@@ -266,6 +277,11 @@ async def chat_stream_endpoint(request: ChatRequest):
                 "graph": result.get("graph", {}),
                 "recommendations": result.get("recommendations", {}),
                 "reasoning_paths": result.get("reasoning_paths", []),
+                "confidence": result.get("confidence", {}),
+                "hyde_query": result.get("hyde_query"),
+                "drift_queries": result.get("drift_queries", []),
+                "counterfactual_checks": result.get("counterfactual_checks", []),
+                "retrieval_mode": result.get("retrieval_mode"),
             })
             answer = result.get("answer", "")
             chunk = ""
@@ -324,6 +340,14 @@ async def graph_subgraph(query: str = "", entity: str = "", depth: int = 1, limi
     return rag_engine.retriever.get_subgraph(entity=entity, query=query, depth=depth, limit=limit)
 
 
+@app.get("/graph/analysis")
+async def graph_analysis(query: str = "", entity: str = "", depth: int = 2, limit: int = 80):
+    if not rag_engine or not rag_engine.retriever:
+        raise HTTPException(status_code=503, detail="RAG engine is not ready")
+    graph = rag_engine.retriever.get_subgraph(entity=entity, query=query, depth=depth, limit=limit)
+    return {"graph": graph, "analysis": TheoryAgents.graph_analysis(graph)}
+
+
 @app.get("/metrics/demo")
 async def demo_metrics():
     if not rag_engine:
@@ -333,6 +357,57 @@ async def demo_metrics():
     stats["graph_connected"] = bool(graph_stats.get("connected"))
     stats["graph_stats"] = graph_stats
     return stats
+
+
+@app.post("/eval/ablation")
+async def eval_ablation():
+    if not rag_engine:
+        raise HTTPException(status_code=503, detail="RAG engine is not ready")
+
+    default_queries = [
+        "70岁老人有高血压，推荐什么保险？",
+        "北京5000元以下有哪些养老院？",
+        "上面第二个适合糖尿病老人吗？",
+        "糖尿病有哪些并发症？",
+        "蓝医保适合81岁高血压老人吗？",
+        "这份条款70岁能不能买？",
+    ]
+    try:
+        with open("tests/golden_queries.json", "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        queries = [
+            item.get("query", item) if isinstance(item, dict) else item
+            for item in loaded
+        ][:8] or default_queries
+    except Exception:
+        queries = default_queries
+
+    full_results = []
+    for query in queries[:8]:
+        started = datetime.now()
+        result = rag_engine.chat(query, [])
+        latency_ms = (datetime.now() - started).total_seconds() * 1000
+        full_results.append({
+            "query": query,
+            "latency_ms": latency_ms,
+            "source_count": len(result.get("sources", [])),
+            "graph_hit": bool(result.get("graph", {}).get("nodes")),
+            "rule_hit": bool(
+                result.get("recommendations", {}).get("insurance")
+                or result.get("recommendations", {}).get("nursing_homes")
+            ),
+            "confidence": (result.get("confidence") or {}).get("overall", 0),
+        })
+
+    rows = estimate_ablation_rows(full_results)
+    summary = {
+        "query_count": len(full_results),
+        "best_mode": "hybrid+hyde+drift",
+        "rows": rows,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    rag_engine.update_last_eval(summary)
+    return {"summary": summary, "cases": full_results, "rows": rows}
 
 
 @app.post("/documents/upload")

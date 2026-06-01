@@ -235,6 +235,8 @@ class GraphRetriever:
         payload.setdefault("graph", {"nodes": [], "edges": [], "paths": []})
 
         raw_query = parsed_query.get("raw_query", "")
+        hyde_query = parsed_query.get("hyde_query", "")
+        vector_query = "\n".join(part for part in [raw_query, hyde_query] if part).strip()
         existing = {(s.get("label"), s.get("name")) for s in payload["sources"]}
         payload["sources"] = [
             self._normalize_source_scores(
@@ -244,9 +246,10 @@ class GraphRetriever:
             )
             for src in payload["sources"]
         ]
-        for src in self.vector_index.search(raw_query, top_k=5):
+        for src in self.vector_index.search(vector_query or raw_query, top_k=5):
             key = (src.get("label"), src.get("name"))
             if key not in existing:
+                src["retrieval_stage"] = "hyde_vector" if hyde_query else "vector"
                 payload["sources"].append(self._normalize_source_scores(src))
                 existing.add(key)
         for src in self._fallback_keyword_sources(raw_query):
@@ -260,6 +263,45 @@ class GraphRetriever:
         payload["graph"]["reasoning_paths"] = payload["reasoning_paths"]
 
         return payload
+
+    def augment_with_drift(self, payload: dict, drift_queries: list, top_k: int = 3) -> tuple[dict, int]:
+        """Run local DRIFT-style second-pass semantic probes and fuse evidence."""
+        if not drift_queries:
+            return payload, 0
+        payload = dict(payload)
+        payload.setdefault("sources", [])
+        existing = {(s.get("label"), s.get("name")) for s in payload["sources"]}
+        added = 0
+        drift_context = []
+        for drift_query in drift_queries[:3]:
+            hits = self.vector_index.search(drift_query, top_k=top_k)
+            if not hits:
+                hits = self._fallback_keyword_sources(drift_query, limit=top_k)
+            for src in hits:
+                key = (src.get("label"), src.get("name"))
+                if key in existing:
+                    continue
+                src = dict(src)
+                src["retrieval_stage"] = "drift"
+                src["drift_query"] = drift_query
+                normalized = self._normalize_source_scores(
+                    src,
+                    graph_score=float(src.get("graph_score", 0.0) or 0.0),
+                    vector_score=float(src.get("vector_score", src.get("score", 0.45)) or 0.45),
+                    rule_score=float(src.get("rule_score", 0.35) or 0.35),
+                )
+                payload["sources"].append(normalized)
+                existing.add(key)
+                added += 1
+                drift_context.append(
+                    f"【DRIFT补充】{normalized.get('label')} · {normalized.get('name')}："
+                    f"{str(normalized.get('snippet', ''))[:180]}"
+                )
+        payload["sources"].sort(key=lambda item: item.get("hybrid_score", item.get("score", 0)), reverse=True)
+        payload["sources"] = payload["sources"][:16]
+        if drift_context:
+            payload["context"] = (payload.get("context") or "") + "\n\n【DRIFT 局部追问补充证据】\n" + "\n".join(drift_context[:6])
+        return payload, added
 
     def retrieve(self, parsed_query: dict) -> str:
         """

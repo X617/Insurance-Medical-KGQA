@@ -123,6 +123,54 @@ h1, h2, h3 {{ color: {PRIMARY} !important; letter-spacing: 0; }}
     padding: .55rem 0;
 }}
 .small-muted {{ color: #64748b; font-size: .9rem; }}
+.confidence-card {{
+    background: #ffffff;
+    border: 1px solid #dbeafe;
+    border-left: 5px solid {PRIMARY};
+    border-radius: 8px;
+    padding: .85rem 1rem;
+    margin: .7rem 0;
+}}
+.confidence-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: .55rem;
+    margin-top: .65rem;
+}}
+.confidence-pill {{
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: .55rem .65rem;
+}}
+.confidence-bar {{
+    height: 7px;
+    background: #e5e7eb;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-top: .35rem;
+}}
+.confidence-fill {{
+    height: 7px;
+    background: linear-gradient(90deg, #0f766e, #2563eb);
+}}
+.algo-chip {{
+    display: inline-block;
+    background: #eef2ff;
+    color: #3730a3;
+    border: 1px solid #c7d2fe;
+    border-radius: 999px;
+    padding: .18rem .55rem;
+    margin: .18rem .25rem .18rem 0;
+    font-size: .82rem;
+}}
+.counter-card {{
+    background: #fff7ed;
+    border: 1px solid #fed7aa;
+    border-radius: 8px;
+    padding: .7rem .85rem;
+    margin-bottom: .55rem;
+}}
 </style>
 """,
     unsafe_allow_html=True,
@@ -157,6 +205,11 @@ def get_graph_stats() -> Dict[str, str]:
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_subgraph(seed: str, depth: int, limit: int) -> Dict[str, Any]:
     return api_get("/graph/subgraph", query=seed, depth=depth, limit=limit, timeout=10.0)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_graph_analysis(seed: str, depth: int, limit: int) -> Dict[str, Any]:
+    return api_get("/graph/analysis", query=seed, depth=depth, limit=limit, timeout=10.0)
 
 
 def render_metric(label: str, value: str) -> None:
@@ -556,6 +609,85 @@ def render_reasoning_paths(paths: List[Dict[str, Any]]) -> None:
         )
 
 
+def render_confidence(confidence: Dict[str, Any]) -> None:
+    if not confidence:
+        return
+    overall = float(confidence.get("overall", 0) or 0)
+    level = confidence.get("level", "-")
+    items = [
+        ("图谱依据", confidence.get("graph_grounding", 0)),
+        ("语义匹配", confidence.get("semantic_match", 0)),
+        ("规则合规", confidence.get("rule_compliance", 0)),
+        ("答案稳定", confidence.get("answer_stability", 0)),
+    ]
+    pills = []
+    for label, value in items:
+        pct = max(0, min(100, float(value or 0) * 100))
+        pills.append(
+            f"""
+<div class="confidence-pill">
+  <div class="small-muted">{html.escape(label)}</div>
+  <b>{pct:.0f}%</b>
+  <div class="confidence-bar"><div class="confidence-fill" style="width:{pct:.0f}%"></div></div>
+</div>
+"""
+        )
+    st.markdown(
+        f"""
+<div class="confidence-card">
+  <div><b>回答可信度：{overall:.1f}/100</b> <span class="tag">等级：{html.escape(str(level))}</span></div>
+  <div class="small-muted">基于图谱命中、HybridRAG 证据、规则合规与模型稳定性综合估计。</div>
+  <div class="confidence-grid">{''.join(pills)}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_algorithm_signals(msg: Dict[str, Any]) -> None:
+    chips = []
+    if msg.get("retrieval_mode"):
+        chips.append(f"检索模式：{msg.get('retrieval_mode')}")
+    if msg.get("hyde_query"):
+        chips.append("HyDE 查询扩展")
+    if msg.get("drift_queries"):
+        chips.append(f"DRIFT 二次追问 × {len(msg.get('drift_queries', []))}")
+    if msg.get("counterfactual_checks"):
+        chips.append(f"反事实校验 × {len(msg.get('counterfactual_checks', []))}")
+    if chips:
+        st.markdown("".join(f'<span class="algo-chip">{html.escape(chip)}</span>' for chip in chips), unsafe_allow_html=True)
+    if msg.get("hyde_query") or msg.get("drift_queries"):
+        with st.expander("HyDE / DRIFT 检索增强", expanded=False):
+            if msg.get("hyde_query"):
+                st.markdown("**HyDE 假设性专业检索扩展**")
+                st.info(msg.get("hyde_query"))
+            if msg.get("drift_queries"):
+                st.markdown("**DRIFT 局部深挖子问题**")
+                for query in msg.get("drift_queries", []):
+                    st.markdown(f"- {query}")
+
+
+def render_counterfactual(checks: List[Dict[str, Any]]) -> None:
+    if not checks:
+        return
+    with st.expander("反事实合规校验", expanded=False):
+        for item in checks:
+            status = "通过" if item.get("passed") else "需谨慎"
+            st.markdown(
+                f"""
+<div class="counter-card">
+  <b>{html.escape(str(item.get("name", "反事实校验")))}</b>
+  <span class="tag">{html.escape(status)}</span>
+  <div>{html.escape(str(item.get("question", "")))}</div>
+  <div class="small-muted">{html.escape(str(item.get("result", "")))}</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+            if item.get("evidence"):
+                st.json(item.get("evidence"), expanded=False)
+
+
 def render_sources(sources: List[Dict[str, Any]]) -> None:
     if not sources:
         st.info("暂无结构化证据来源。")
@@ -702,6 +834,32 @@ def metrics_panel() -> None:
         f"节点标签：`{len(graph_stats.get('labels', {}))}`　"
         f"关系数：`{graph_stats.get('relationships', 0)}`"
     )
+    cols2 = st.columns(4)
+    cards2 = [
+        ("平均可信度", f"{metrics.get('avg_confidence', 0)}"),
+        ("HyDE 次数", str(metrics.get("hyde_hits", 0))),
+        ("DRIFT 次数", str(metrics.get("drift_hits", 0))),
+        ("反事实通过率", f"{metrics.get('counterfactual_pass_rate', 0) * 100:.1f}%"),
+    ]
+    for col, (label, value) in zip(cols2, cards2):
+        with col:
+            render_metric(label, value)
+    st.markdown("**消融实验对比**")
+    if st.button("运行固定问题消融评测", use_container_width=True):
+        with st.spinner("正在运行消融评测，可能需要几十秒..."):
+            try:
+                resp = requests.post(f"{API_ROOT}/eval/ablation", timeout=(5, 180))
+                if resp.status_code == 200:
+                    st.session_state.ablation_report = resp.json()
+                    st.success("消融评测完成。")
+                else:
+                    st.error(resp.text)
+            except Exception as exc:
+                st.error(f"评测失败：{exc}")
+    report = st.session_state.get("ablation_report") or {}
+    if report.get("rows"):
+        st.dataframe(report["rows"], use_container_width=True, hide_index=True)
+        st.caption("说明：轻量演示版以完整链路结果为基准估计各检索模式贡献，并展示算法消融趋势。")
     st.markdown("**Golden Queries 覆盖面**")
     golden = [
         "70岁老人有高血压，推荐什么保险？",
@@ -745,6 +903,11 @@ def request_chat_reply(prompt: str) -> Dict[str, Any]:
                 "recommendations": data.get("recommendations", {}),
                 "trace": data.get("trace", []),
                 "reasoning_paths": data.get("reasoning_paths", []),
+                "confidence": data.get("confidence", {}),
+                "hyde_query": data.get("hyde_query"),
+                "drift_queries": data.get("drift_queries", []),
+                "counterfactual_checks": data.get("counterfactual_checks", []),
+                "retrieval_mode": data.get("retrieval_mode"),
             }
         return {
             "role": "assistant",
@@ -795,6 +958,9 @@ def iter_sse_chat(prompt: str):
 
 
 def render_assistant_details(msg: Dict[str, Any], expanded_graph: bool = False, include_trace: bool = True) -> None:
+    render_algorithm_signals(msg)
+    render_confidence(msg.get("confidence", {}))
+    render_counterfactual(msg.get("counterfactual_checks", []))
     render_recommendations(msg.get("recommendations", {}))
     with st.expander("知识图谱证据图", expanded=expanded_graph):
         render_graph(msg.get("graph", {}))
@@ -835,7 +1001,6 @@ def render_current_turn(prompt: str) -> None:
     with st.chat_message("assistant"):
         answer_box = st.empty()
         trace_holder = st.empty()
-        details_holder = st.empty()
         answer_text = ""
         trace: List[Dict[str, Any]] = []
         assistant_msg = {
@@ -847,6 +1012,11 @@ def render_current_turn(prompt: str) -> None:
             "recommendations": {},
             "trace": [],
             "reasoning_paths": [],
+            "confidence": {},
+            "hyde_query": None,
+            "drift_queries": [],
+            "counterfactual_checks": [],
+            "retrieval_mode": None,
         }
         try:
             with st.status("Agent 推理中：意图解析、HybridRAG 检索、规则过滤与答案生成...", expanded=False) as status:
@@ -864,6 +1034,11 @@ def render_current_turn(prompt: str) -> None:
                             "graph": payload.get("graph", {}),
                             "recommendations": payload.get("recommendations", {}),
                             "reasoning_paths": payload.get("reasoning_paths", []),
+                            "confidence": payload.get("confidence", {}),
+                            "hyde_query": payload.get("hyde_query"),
+                            "drift_queries": payload.get("drift_queries", []),
+                            "counterfactual_checks": payload.get("counterfactual_checks", []),
+                            "retrieval_mode": payload.get("retrieval_mode"),
                         })
                     elif event == "final":
                         assistant_msg.update({
@@ -874,6 +1049,11 @@ def render_current_turn(prompt: str) -> None:
                             "recommendations": payload.get("recommendations", assistant_msg.get("recommendations", {})),
                             "trace": payload.get("trace", trace),
                             "reasoning_paths": payload.get("reasoning_paths", assistant_msg.get("reasoning_paths", [])),
+                            "confidence": payload.get("confidence", assistant_msg.get("confidence", {})),
+                            "hyde_query": payload.get("hyde_query", assistant_msg.get("hyde_query")),
+                            "drift_queries": payload.get("drift_queries", assistant_msg.get("drift_queries", [])),
+                            "counterfactual_checks": payload.get("counterfactual_checks", assistant_msg.get("counterfactual_checks", [])),
+                            "retrieval_mode": payload.get("retrieval_mode", assistant_msg.get("retrieval_mode")),
                         })
                     elif event == "error":
                         raise RuntimeError(payload.get("message", "流式接口异常"))
@@ -916,6 +1096,40 @@ def render_live_reasoning(stage_box, active: str = "") -> None:
     )
 
 
+def algorithm_explain_panel() -> None:
+    st.markdown("### 算法解释")
+    st.markdown(
+        """
+本系统的第三阶段链路定位为 **GraphRAG + HybridRAG + HyDE/DRIFT + 合规规则 + 反事实校验**。
+这里展示的是可公开解释的执行轨迹，不展示模型隐藏思维链。
+"""
+    )
+    flow = [
+        ("Intent", "抽取年龄、疾病、城市、预算、险种等结构化字段。"),
+        ("HyDE", "生成假设性专业检索扩展，弥补短问题语义不足。"),
+        ("Graph / Vector Recall", "Neo4j 精确图谱召回 + 本地语义/关键词召回。"),
+        ("DRIFT", "基于初始证据生成局部追问，二次深挖相关证据。"),
+        ("Rule Filter", "年龄、险种、预算、城市等硬规则过滤候选。"),
+        ("Counterfactual", "检查年龄或疾病变化后推荐是否仍成立。"),
+        ("Answer", "基于证据和结构化候选生成最终回答。"),
+    ]
+    for name, desc in flow:
+        st.markdown(
+            f"""
+<div class="trace-step">
+  <span class="trace-agent">{html.escape(name)}</span>
+  <div class="small-muted">{html.escape(desc)}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+    # st.markdown("**设计思路**")
+    # st.info(
+    #     "先用固定问题触发回答，再依次展开：结构化推荐、知识图谱证据图、证据来源、Agent 推理过程、可信度与反事实校验。"
+    #     "最后切到系统评测页展示消融实验，说明 Hybrid + HyDE + DRIFT 相比关键词或纯图谱召回有更高证据覆盖。"
+    # )
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "sidebar_prompt" not in st.session_state:
@@ -945,7 +1159,8 @@ with st.sidebar:
         render_metric("养老机构", stats["NursingHome"])
     render_metric("图谱关系", stats["Relations"])
     st.divider()
-    temperature = st.slider("严谨度", 0.0, 1.0, 0.3, help="演示版后端当前固定低温生成，该滑块保留为交互偏好。")
+    # temperature = st.slider("严谨度", 0.0, 1.0, 0.3, help="演示版后端当前固定低温生成，该滑块保留为交互偏好。")
+    temperature = st.slider("严谨度", 0.0, 1.0, 0.3)
     st.markdown(
         """
 <div class="feature-box">
@@ -953,13 +1168,13 @@ with st.sidebar:
   <div class="feature-copy">图谱证据链、Agent 推理过程、保险合规过滤、养老机构预算筛选、条款资料问答。</div>
 </div>
 <div class="feature-box">
-  <div class="feature-title">答辩看点</div>
-  <div class="feature-copy">每个回答都能展开底层证据图和推理链路，突出系统不是普通聊天页面。</div>
+  <div class="feature-title">证据溯源</div>
+  <div class="feature-copy">每个回答都能展开底层证据图和推理链路，提供有力证据支撑和模型可解释性。</div>
 </div>
 """,
         unsafe_allow_html=True,
     )
-    st.markdown("#### 演示场景")
+    st.markdown("#### 示例")
     st.markdown('<div class="scenario-button">', unsafe_allow_html=True)
     st.button(
         "70岁老人有高血压，推荐什么保险？",
@@ -1002,7 +1217,7 @@ else:
 if typed_prompt := st.chat_input("请描述您的情况，例如：70岁老人有高血压，推荐什么保险？"):
     chat_prompt_to_submit = typed_prompt
 
-tab_chat, tab_upload, tab_graph, tab_metrics = st.tabs(["智能问答", "资料解析", "图谱探索", "系统评测"])
+tab_chat, tab_upload, tab_graph, tab_metrics, tab_algo = st.tabs(["智能问答", "资料解析", "图谱探索", "系统评测", "算法解释"])
 
 with tab_chat:
     for idx, msg in enumerate(st.session_state.messages):
@@ -1022,7 +1237,7 @@ with tab_upload:
 
 with tab_graph:
     st.markdown("### 图谱子图探索")
-    st.caption("面向答辩展示的交互式子图工作台：支持更深层关系扩展、拖拽节点、滚轮缩放和证据路径查看。")
+    st.caption("交互式子图工作台：支持更深层关系扩展、拖拽节点、滚轮缩放和证据路径查看。")
     col_query, col_depth, col_limit = st.columns([4, 1.4, 1.6])
     with col_query:
         seed = st.text_input("输入实体或问题关键词", value="高血压")
@@ -1075,6 +1290,24 @@ with tab_graph:
                 use_container_width=True,
                 hide_index=True,
             )
+        analysis = cached_graph_analysis(seed, depth, limit).get("analysis", {})
+        if analysis:
+            st.markdown("**局部图分析**")
+            st.info(analysis.get("summary", ""))
+            a_col, b_col = st.columns(2)
+            with a_col:
+                st.markdown("核心实体排行")
+                st.dataframe(analysis.get("core_nodes", []), use_container_width=True, hide_index=True)
+            with b_col:
+                st.markdown("社区摘要")
+                st.dataframe(analysis.get("communities", []), use_container_width=True, hide_index=True)
+            with st.expander("k-core 近似分层与最短路径", expanded=False):
+                st.dataframe(analysis.get("k_core_layers", []), use_container_width=True, hide_index=True)
+                for path in analysis.get("shortest_paths", []):
+                    st.caption(path)
 
 with tab_metrics:
     metrics_panel()
+
+with tab_algo:
+    algorithm_explain_panel()

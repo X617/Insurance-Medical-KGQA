@@ -70,6 +70,7 @@ def run(api_root: str, limit: int | None = None, timeout: float = 45.0) -> Dict[
                 len((result.get("recommendations") or {}).get(key) or [])
                 for key in ("insurance", "nursing_homes")
             )
+            confidence = (result.get("confidence") or {}).get("overall", 0)
             answer = result.get("answer") or ""
             ok = bool(answer.strip()) and rule_ok(query, result)
             rows.append({
@@ -80,6 +81,8 @@ def run(api_root: str, limit: int | None = None, timeout: float = 45.0) -> Dict[
                 "graph_hit": graph_hit,
                 "source_count": source_count,
                 "candidate_count": candidate_count,
+                "confidence": confidence,
+                "retrieval_mode": result.get("retrieval_mode", ""),
                 "rule_ok": rule_ok(query, result),
                 "answer_preview": answer[:120],
             })
@@ -103,8 +106,15 @@ def run(api_root: str, limit: int | None = None, timeout: float = 45.0) -> Dict[
         "pass_rate": round(passed / max(1, len(rows)), 4),
         "avg_latency_ms": round(sum(row.get("latency_ms", 0) for row in rows) / max(1, len(rows)), 2),
         "graph_hit_rate": round(sum(1 for row in rows if row.get("graph_hit")) / max(1, len(rows)), 4),
+        "avg_confidence": round(sum(float(row.get("confidence") or 0) for row in rows) / max(1, len(rows)), 2),
     }
     return {"summary": summary, "rows": rows}
+
+
+def run_ablation(api_root: str, timeout: float = 180.0) -> Dict[str, Any]:
+    resp = requests.post(f"{api_root.rstrip('/')}/eval/ablation", timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def write_reports(report: Dict[str, Any]) -> None:
@@ -117,15 +127,16 @@ def write_reports(report: Dict[str, Any]) -> None:
         f"- Passed: {report['summary']['passed']}",
         f"- Pass rate: {report['summary']['pass_rate']:.2%}",
         f"- Avg latency: {report['summary']['avg_latency_ms']} ms",
+        f"- Avg confidence: {report['summary'].get('avg_confidence', 0)}",
         "",
-        "| ID | OK | Latency(ms) | Graph | Sources | Candidates | Query |",
-        "| --- | --- | ---: | --- | ---: | ---: | --- |",
+        "| ID | OK | Latency(ms) | Graph | Sources | Candidates | Confidence | Query |",
+        "| --- | --- | ---: | --- | ---: | ---: | ---: | --- |",
     ]
     for row in report["rows"]:
         lines.append(
             f"| {row.get('id')} | {row.get('ok')} | {row.get('latency_ms')} | "
             f"{row.get('graph_hit', '')} | {row.get('source_count', '')} | "
-            f"{row.get('candidate_count', '')} | {row.get('query')} |"
+            f"{row.get('candidate_count', '')} | {row.get('confidence', '')} | {row.get('query')} |"
         )
     (REPORT_DIR / "eval_report.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -134,7 +145,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-root", default="http://127.0.0.1:8000")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--ablation", action="store_true", help="Call /eval/ablation and save the ablation report.")
     args = parser.parse_args()
+    if args.ablation:
+        report = run_ablation(args.api_root)
+        REPORT_DIR.mkdir(exist_ok=True)
+        (REPORT_DIR / "ablation_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(report.get("summary", {}), ensure_ascii=False, indent=2))
+        print(f"Ablation report written to {REPORT_DIR / 'ablation_report.json'}")
+        return
     report = run(args.api_root, args.limit)
     write_reports(report)
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))

@@ -142,17 +142,35 @@ KGQA_EMBEDDING_CACHE=.cache/kgqa_bge_small_zh_v15.pkl
 如果主模型临时失败，系统会自动降级到 `DEEPSEEK_FALLBACK_MODEL`，避免演示现场直接中断。
 `v4-pro` 的 thinking 会占用输出 token 且响应更慢；如果 `max_tokens` 太小，可能只返回 `reasoning_content` 而没有最终 `content`。系统已设置 `DEEPSEEK_PRO_MIN_TOKENS` 和 `DEEPSEEK_TIMEOUT`，并在最终内容为空时自动降级。
 
+## 阶段三算法增强
+
+当前版本新增了可用于答辩讲解的轻量算法层：
+
+- `HyDEAgent`：为短问题生成专业检索扩展，不额外调用 LLM，用于提升向量/关键词召回覆盖。
+- `DriftAgent`：根据初始证据生成 2-3 个局部追问，进行二次召回并融合排序。
+- `CounterfactualAgent`：对年龄、疾病、预算等边界条件做反事实合规检查。
+- `ConfidenceAgent`：综合图谱依据、语义匹配、规则合规和模型稳定性输出回答可信度。
+- `GET /graph/analysis`：返回局部子图核心实体、社区摘要、k-core 近似分层和最短路径。
+- `POST /eval/ablation`：输出 `keyword_only`、`graph_only`、`hybrid`、`hybrid+hyde+drift` 的消融对比。
+
+可在系统评测页点击“运行固定问题消融评测”，或在终端运行：
+
+```bash
+python scripts/eval_demo.py --ablation
+```
+
 ## 当前核心链路
 
 1. 用户在 `frontend/streamlit_app.py` 输入问题。
-2. 前端向 `POST /chat` 发送 `query` 和最近 6 条对话历史。
+2. 前端优先向 `POST /chat/stream` 发送 `query` 和最近 6 条对话历史，失败时回退 `POST /chat`。
 3. `src/api/main.py` 接收请求，调用全局 `RAGEngine`。
 4. `RAGEngine` 先用 LLM 对多轮追问做问题重写。
-5. `QueryParser` 再用 LLM 输出 JSON 意图，包括保险、疾病、养老院、年龄、城市、预算等字段。
-6. `GraphRetriever` 根据意图拼 Cypher，从 Neo4j 检索疾病、药品、保险、养老院子图信息。
-7. `RAGEngine` 把图谱检索结果、历史回答、当前问题拼进 Prompt。
-8. `LLMIntegration` 调用 DeepSeek/OpenAI 兼容接口生成最终回答。
-9. 前端展示回答，并在折叠区展示图谱上下文作为溯源。
+5. `QueryParser` 用规则/LLM 输出 JSON 意图，包括保险、疾病、养老院、年龄、城市、预算等字段。
+6. `HyDEAgent` 生成专业检索扩展，`GraphRetriever` 执行 Neo4j 图谱召回、本地向量召回和关键词兜底。
+7. `DriftAgent` 生成局部追问并二次召回，随后进行 Hybrid 分数融合排序。
+8. 后端执行年龄、险种、城市、预算等硬规则过滤，并通过 `CounterfactualAgent` 做反事实检查。
+9. `LLMIntegration` 调用 DeepSeek/OpenAI 兼容接口生成最终回答。
+10. `ConfidenceAgent` 输出可信度，前端展示结构化推荐、证据图、证据来源、Agent trace 和评测指标。
 
 ## 文件结构
 
@@ -160,6 +178,7 @@ KGQA_EMBEDDING_CACHE=.cache/kgqa_bge_small_zh_v15.pkl
 - `frontend/app.py`：较早版本的 Streamlit 前端，功能更朴素，可作为参考或废弃候选。
 - `src/api/main.py`：FastAPI 服务入口，提供 `/chat` 和 `/health`。
 - `src/graph_rag/rag_engine.py`：GraphRAG 总控，串联问题重写、意图解析、图谱检索和答案生成。
+- `src/graph_rag/theory_agents.py`：阶段三算法增强，包含 HyDE、DRIFT、可信度、反事实校验、图分析和消融估计。
 - `src/graph_rag/query_understanding.py`：LLM 意图识别，输出结构化 JSON。
 - `src/graph_rag/graph_retriever.py`：当前实际使用的 Neo4j 检索器，按疾病、年龄、保险关键词、城市和预算检索。
 - `src/graph_rag/graph_retrieval.py`：旧版通用子图检索器，目前没有接入主链路。
