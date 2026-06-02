@@ -518,11 +518,17 @@ def ensure_local_session() -> None:
         st.session_state.chat_manager_scope = "qa"
     if "pending_payment" not in st.session_state:
         st.session_state.pending_payment = None
+    if "legacy_messages_migrated" not in st.session_state:
+        st.session_state.legacy_messages_migrated = False
     if "local_guest" not in st.session_state:
         st.session_state.local_guest = default_user("访客")
     if normalize_user_chats(st.session_state.local_guest):
         st.session_state.local_guest = st.session_state.local_guest
-    if "messages" in st.session_state and st.session_state.messages:
+    if (
+        not st.session_state.legacy_messages_migrated
+        and "messages" in st.session_state
+        and st.session_state.messages
+    ):
         guest_space = st.session_state.local_guest["chat_spaces"]["qa"]
         guest_chat = guest_space["sessions"][guest_space["active_id"]]
         if not guest_chat["messages"]:
@@ -530,6 +536,7 @@ def ensure_local_session() -> None:
             first_user = next((m.get("content", "") for m in st.session_state.messages if m.get("role") == "user"), "")
             guest_chat["title"] = compact_title(first_user)
             guest_chat["updated_at"] = now_text()
+        st.session_state.legacy_messages_migrated = True
 
 
 def current_user_record() -> Dict[str, Any]:
@@ -605,6 +612,9 @@ def start_new_chat(space_key: str = "qa") -> None:
     space["sessions"][chat_id] = empty_chat(chat_id)
     space["active_id"] = chat_id
     save_current_user_record(user)
+    st.session_state.sidebar_prompt = None
+    st.session_state.pop("doc_pending_question", None)
+    st.session_state.doc_request_inflight = False
     sync_legacy_messages(space_key)
 
 
@@ -614,6 +624,9 @@ def select_chat(space_key: str, chat_id: str) -> None:
     if space and chat_id in space.get("sessions", {}):
         space["active_id"] = chat_id
         save_current_user_record(user)
+        st.session_state.sidebar_prompt = None
+        st.session_state.pop("doc_pending_question", None)
+        st.session_state.doc_request_inflight = False
         sync_legacy_messages(space_key)
 
 
@@ -1298,7 +1311,7 @@ def render_chat_manager() -> None:
     st.session_state.chat_manager_scope = "qa" if scope_label == "智能问答" else "doc"
     scope = st.session_state.chat_manager_scope
 
-    if st.button("新建 Chat", use_container_width=True):
+    if st.button("新建 Chat", use_container_width=True, key=f"new_chat_{scope}"):
         start_new_chat(scope)
         st.rerun()
     search = st.text_input("Search Chat", placeholder="按标题搜索", key=f"chat_search_{scope}")
