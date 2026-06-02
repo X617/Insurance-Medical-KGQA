@@ -1404,20 +1404,24 @@ def membership_panel() -> None:
                 st.session_state.pending_payment = None
 
 
-def queue_document_question() -> None:
-    question = (st.session_state.get("doc_text_input") or "").strip()
-    if not question:
+def document_question_just_answered(question: str) -> bool:
+    messages = active_messages("doc")
+    return (
+        len(messages) >= 2
+        and messages[-2].get("role") == "user"
+        and messages[-2].get("content") == question
+        and messages[-1].get("role") == "assistant"
+    )
+
+
+def answer_document_question(question: str) -> None:
+    document_id = st.session_state.get("document_id")
+    question = (question or "").strip()
+    if not document_id or not question:
         return
     if st.session_state.get("doc_request_inflight"):
         return
-    st.session_state.doc_pending_question = question
-    st.session_state.doc_text_input = ""
-
-
-def handle_pending_document_question() -> None:
-    document_id = st.session_state.get("document_id")
-    question = st.session_state.pop("doc_pending_question", None)
-    if not document_id or not question:
+    if document_question_just_answered(question):
         return
 
     st.session_state.doc_request_inflight = True
@@ -1446,7 +1450,16 @@ def handle_pending_document_question() -> None:
             st.error(f"资料问答失败：{exc}")
         finally:
             st.session_state.doc_request_inflight = False
-    st.rerun()
+
+
+def submit_document_question(question: str) -> None:
+    answer_document_question(question)
+
+
+def handle_pending_document_question() -> None:
+    question = st.session_state.pop("doc_pending_question", None)
+    if question:
+        answer_document_question(question)
 
 
 def upload_document_panel() -> None:
@@ -1525,23 +1538,24 @@ def upload_document_panel() -> None:
 
         handle_pending_document_question()
 
-        doc_input_col, doc_send_col = st.columns([10, 1])
-        with doc_input_col:
-            st.text_input(
-                "资料输入",
-                placeholder="围绕已上传资料追问，例如：这份条款 70 岁能不能买？",
-                key="doc_text_input",
-                label_visibility="collapsed",
-                disabled=st.session_state.get("doc_request_inflight", False),
-            )
-        with doc_send_col:
-            st.button(
-                "➤",
-                key="doc_send_button",
-                use_container_width=True,
-                on_click=queue_document_question,
-                disabled=st.session_state.get("doc_request_inflight", False),
-            )
+        with st.form("doc_question_form", clear_on_submit=True):
+            doc_input_col, doc_send_col = st.columns([10, 1])
+            with doc_input_col:
+                doc_question = st.text_input(
+                    "资料输入",
+                    placeholder="围绕已上传资料追问，例如：这份条款 70 岁能不能买？",
+                    key="doc_text_input",
+                    label_visibility="collapsed",
+                    disabled=st.session_state.get("doc_request_inflight", False),
+                )
+            with doc_send_col:
+                doc_submitted = st.form_submit_button(
+                    "➤",
+                    use_container_width=True,
+                    disabled=st.session_state.get("doc_request_inflight", False),
+                )
+        if doc_submitted:
+            submit_document_question(doc_question)
 
 
 def metrics_panel() -> None:
