@@ -3,6 +3,7 @@ import json
 import math
 import os
 import pickle
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -47,9 +48,11 @@ class LightweightVectorIndex:
         self._semantic_vectors = None
         self._semantic_model = None
         self._loaded = False
+        self._load_lock = threading.Lock()
         self.use_embeddings = os.getenv("KGQA_USE_EMBEDDINGS", "0") == "1"
         self.embedding_model_name = os.getenv("KGQA_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
         self.embedding_device = os.getenv("KGQA_EMBEDDING_DEVICE", "cpu")
+        self.embedding_local_only = os.getenv("KGQA_EMBEDDING_LOCAL_ONLY", "1") == "1"
         cache_name = os.getenv("KGQA_EMBEDDING_CACHE", ".cache/kgqa_bge_small_zh_v15.pkl")
         self.embedding_cache = get_project_root() / cache_name
 
@@ -76,6 +79,12 @@ class LightweightVectorIndex:
     def load(self) -> None:
         if self._loaded:
             return
+        with self._load_lock:
+            if self._loaded:
+                return
+            self._load_unlocked()
+
+    def _load_unlocked(self) -> None:
         root = get_project_root()
 
         insurance_path = root / "DataCleaned" / "Insurance" / "insurance_info.json"
@@ -118,9 +127,15 @@ class LightweightVectorIndex:
         if self._semantic_model is not None:
             return self._semantic_model
         try:
+            if self.embedding_local_only:
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
             from sentence_transformers import SentenceTransformer
 
-            self._semantic_model = SentenceTransformer(self.embedding_model_name, device=self.embedding_device)
+            model_kwargs = {"device": self.embedding_device}
+            if self.embedding_local_only:
+                model_kwargs["local_files_only"] = True
+            self._semantic_model = SentenceTransformer(self.embedding_model_name, **model_kwargs)
             return self._semantic_model
         except Exception as exc:
             logger.warning(f"Embedding model unavailable, fallback to char n-gram recall: {exc}")

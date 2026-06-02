@@ -201,6 +201,9 @@ async def lifespan(app: FastAPI):
     global rag_engine
     logger.info("Initializing RAG Engine...")
     rag_engine = RAGEngine()
+    if os.getenv("KGQA_WARMUP_ON_START", "1") == "1":
+        logger.info("Warming up retrieval resources before serving queries...")
+        rag_engine.warmup()
     yield
     # 关闭时清理
     logger.info("Closing RAG Engine...")

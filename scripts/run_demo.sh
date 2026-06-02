@@ -84,6 +84,11 @@ if [ "${RUN_IMPORT:-0}" = "1" ]; then
   python -m src.kg_construction.neo4j_loader
 fi
 
+if [ "${KGQA_USE_EMBEDDINGS:-0}" = "1" ] && [ "${KGQA_PREBUILD_EMBEDDINGS:-1}" = "1" ]; then
+  echo "正在预热 HybridRAG embedding 索引；首次构建可能需要几十秒，之后会读取 .cache 缓存。"
+  python scripts/build_embedding_index.py || echo "Embedding 预热失败，将在运行时降级为轻量字符召回。"
+fi
+
 cleanup() {
   if [ -n "${BACKEND_PID:-}" ]; then
     kill "$BACKEND_PID" 2>/dev/null || true

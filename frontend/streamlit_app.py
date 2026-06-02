@@ -1,5 +1,5 @@
 import base64
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import hashlib
 import html
 import json
@@ -235,7 +235,8 @@ h1, h2, h3 {{ color: {PRIMARY} !important; letter-spacing: 0; }}
     padding: 1rem;
     margin-top: .8rem;
 }}
-div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) {{
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button),
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="资料输入"]):has(> div:nth-child(2) button) {{
     position: fixed;
     left: var(--chat-input-left, 28rem);
     right: 2.2rem;
@@ -247,11 +248,13 @@ div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="�
     padding: .55rem .65rem;
     box-shadow: 0 16px 36px rgba(15, 23, 42, .14);
 }}
-div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) input {{
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) input,
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="资料输入"]):has(> div:nth-child(2) button) input {{
     background: #f3f6fb;
     border: 0 !important;
 }}
-div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) button {{
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) button,
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="资料输入"]):has(> div:nth-child(2) button) button {{
     min-height: 2.45rem;
 }}
 [data-testid="stSidebar"] > div:first-child {{
@@ -327,6 +330,10 @@ def today_text() -> str:
     return date.today().isoformat()
 
 
+def now_text() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def hash_password(password: str, salt: str) -> str:
     return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
 
@@ -357,13 +364,61 @@ def compact_title(text: str) -> str:
     return text[:18] + ("..." if len(text) > 18 else "")
 
 
+def clean_title(text: str, fallback: str = "新对话") -> str:
+    title = " ".join(str(text or "").replace("\n", " ").split())
+    title = title.strip(" \t\r\n\"'“”‘’《》[]【】()（）。，、！？,.!?;；:：")
+    if not title:
+        return fallback
+    for prefix in ("标题：", "标题:", "会话标题：", "会话标题:"):
+        if title.startswith(prefix):
+            title = title[len(prefix):].strip()
+    return title[:18] + ("..." if len(title) > 18 else "")
+
+
+def summarize_chat_title(user_text: str, assistant_text: str = "") -> str:
+    fallback = compact_title(user_text)
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key or api_key == "sk-your-key":
+        return fallback
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    title_model = os.getenv("DEEPSEEK_TITLE_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+    prompt = (
+        "请为下面这轮保险医养问答生成一个中文会话标题。"
+        "要求：6到14个汉字，精准概括用户意图，不要标点，不要解释。\n\n"
+        f"用户问题：{user_text[:500]}\n"
+        f"系统回答：{assistant_text[:700]}"
+    )
+    try:
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": title_model,
+                "messages": [
+                    {"role": "system", "content": "你是一个会话标题生成器，只输出短标题。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 32,
+                "stream": False,
+            },
+            timeout=(4, 10),
+        )
+        response.raise_for_status()
+        data = response.json()
+        title = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return clean_title(title, fallback)
+    except Exception:
+        return fallback
+
+
 def empty_chat(chat_id: str) -> Dict[str, Any]:
     return {
         "id": chat_id,
         "title": "新对话",
         "messages": [],
-        "created_at": today_text(),
-        "updated_at": today_text(),
+        "created_at": now_text(),
+        "updated_at": now_text(),
     }
 
 
@@ -380,6 +435,78 @@ def default_user(username: str) -> Dict[str, Any]:
     }
 
 
+def first_user_content(chat: Dict[str, Any]) -> str:
+    for msg in chat.get("messages", []) or []:
+        if msg.get("role") == "user":
+            return " ".join(str(msg.get("content", "")).split())
+    return ""
+
+
+def normalize_chat_space(space_key: str, space: Dict[str, Any]) -> bool:
+    changed = False
+    sessions = space.setdefault("sessions", {})
+    if not sessions:
+        chat_id = make_chat_id(space_key)
+        sessions[chat_id] = empty_chat(chat_id)
+        space["active_id"] = chat_id
+        return True
+
+    active_id = space.get("active_id")
+    seen: Dict[str, str] = {}
+    for chat_id, chat in list(sessions.items()):
+        if not isinstance(chat, dict):
+            sessions[chat_id] = empty_chat(chat_id)
+            changed = True
+            continue
+        if chat.get("id") != chat_id:
+            chat["id"] = chat_id
+            changed = True
+        if not chat.get("created_at"):
+            chat["created_at"] = now_text()
+            changed = True
+        if not chat.get("updated_at"):
+            chat["updated_at"] = chat.get("created_at") or now_text()
+            changed = True
+
+        first_user = first_user_content(chat)
+        dedupe_key = first_user or f"__empty__:{chat.get('title', '新对话')}"
+        if dedupe_key in seen:
+            kept_id = seen[dedupe_key]
+            kept = sessions.get(kept_id, {})
+            current_is_active = chat_id == active_id
+            kept_is_active = kept_id == active_id
+            current_newer = str(chat.get("updated_at", "")) > str(kept.get("updated_at", ""))
+            if current_is_active or (current_newer and not kept_is_active):
+                sessions.pop(kept_id, None)
+                seen[dedupe_key] = chat_id
+            else:
+                sessions.pop(chat_id, None)
+            changed = True
+        else:
+            seen[dedupe_key] = chat_id
+
+    if space.get("active_id") not in sessions:
+        latest_id = max(
+            sessions,
+            key=lambda cid: str(sessions[cid].get("updated_at") or sessions[cid].get("created_at") or ""),
+        )
+        space["active_id"] = latest_id
+        changed = True
+    return changed
+
+
+def normalize_user_chats(user: Dict[str, Any]) -> bool:
+    changed = False
+    spaces = user.setdefault("chat_spaces", {})
+    for space_key in ("qa", "doc"):
+        if space_key not in spaces:
+            chat_id = make_chat_id(space_key)
+            spaces[space_key] = {"active_id": chat_id, "sessions": {chat_id: empty_chat(chat_id)}}
+            changed = True
+        changed = normalize_chat_space(space_key, spaces[space_key]) or changed
+    return changed
+
+
 def ensure_local_session() -> None:
     if "auth_user" not in st.session_state:
         st.session_state.auth_user = None
@@ -393,6 +520,8 @@ def ensure_local_session() -> None:
         st.session_state.pending_payment = None
     if "local_guest" not in st.session_state:
         st.session_state.local_guest = default_user("访客")
+    if normalize_user_chats(st.session_state.local_guest):
+        st.session_state.local_guest = st.session_state.local_guest
     if "messages" in st.session_state and st.session_state.messages:
         guest_space = st.session_state.local_guest["chat_spaces"]["qa"]
         guest_chat = guest_space["sessions"][guest_space["active_id"]]
@@ -400,6 +529,7 @@ def ensure_local_session() -> None:
             guest_chat["messages"] = st.session_state.messages
             first_user = next((m.get("content", "") for m in st.session_state.messages if m.get("role") == "user"), "")
             guest_chat["title"] = compact_title(first_user)
+            guest_chat["updated_at"] = now_text()
 
 
 def current_user_record() -> Dict[str, Any]:
@@ -413,10 +543,14 @@ def current_user_record() -> Dict[str, Any]:
         user = default_user(username)
         store.setdefault("users", {})[username] = user
         save_user_store(store)
+    if normalize_user_chats(user):
+        store.setdefault("users", {})[username] = user
+        save_user_store(store)
     return user
 
 
 def save_current_user_record(user: Dict[str, Any]) -> None:
+    normalize_user_chats(user)
     if st.session_state.get("auth_user"):
         store = load_user_store()
         store.setdefault("users", {})[st.session_state.auth_user] = user
@@ -445,8 +579,23 @@ def active_messages(space_key: str = "qa") -> List[Dict[str, Any]]:
     return active_chat(space_key).setdefault("messages", [])
 
 
-def sync_legacy_messages() -> None:
-    st.session_state.messages = active_messages("qa")
+def active_chat_from_user(user: Dict[str, Any], space_key: str = "qa") -> Dict[str, Any]:
+    spaces = user.setdefault("chat_spaces", {})
+    if space_key not in spaces:
+        chat_id = make_chat_id(space_key)
+        spaces[space_key] = {"active_id": chat_id, "sessions": {chat_id: empty_chat(chat_id)}}
+    space = spaces[space_key]
+    sessions = space.setdefault("sessions", {})
+    if space.get("active_id") not in sessions:
+        chat_id = make_chat_id(space_key)
+        sessions[chat_id] = empty_chat(chat_id)
+        space["active_id"] = chat_id
+    return sessions[space["active_id"]]
+
+
+def sync_legacy_messages(space_key: str = "qa") -> None:
+    if space_key == "qa":
+        st.session_state.messages = active_messages("qa")
 
 
 def start_new_chat(space_key: str = "qa") -> None:
@@ -456,7 +605,7 @@ def start_new_chat(space_key: str = "qa") -> None:
     space["sessions"][chat_id] = empty_chat(chat_id)
     space["active_id"] = chat_id
     save_current_user_record(user)
-    sync_legacy_messages()
+    sync_legacy_messages(space_key)
 
 
 def select_chat(space_key: str, chat_id: str) -> None:
@@ -465,29 +614,29 @@ def select_chat(space_key: str, chat_id: str) -> None:
     if space and chat_id in space.get("sessions", {}):
         space["active_id"] = chat_id
         save_current_user_record(user)
-        sync_legacy_messages()
+        sync_legacy_messages(space_key)
 
 
 def append_chat_pair(space_key: str, user_msg: Dict[str, Any], assistant_msg: Dict[str, Any]) -> None:
     user = current_user_record()
-    chat = active_chat(space_key)
+    chat = active_chat_from_user(user, space_key)
     was_empty = not chat.get("messages")
     chat.setdefault("messages", []).extend([user_msg, assistant_msg])
     if was_empty or chat.get("title") == "新对话":
-        chat["title"] = compact_title(user_msg.get("content", ""))
-    chat["updated_at"] = today_text()
+        chat["title"] = summarize_chat_title(user_msg.get("content", ""), assistant_msg.get("content", ""))
+    chat["updated_at"] = now_text()
     save_current_user_record(user)
-    sync_legacy_messages()
+    sync_legacy_messages(space_key)
 
 
 def clear_active_chat(space_key: str = "qa") -> None:
     user = current_user_record()
-    chat = active_chat(space_key)
+    chat = active_chat_from_user(user, space_key)
     chat["messages"] = []
     chat["title"] = "新对话"
-    chat["updated_at"] = today_text()
+    chat["updated_at"] = now_text()
     save_current_user_record(user)
-    sync_legacy_messages()
+    sync_legacy_messages(space_key)
 
 
 def login_user(username: str, password: str) -> bool:
@@ -1255,6 +1404,51 @@ def membership_panel() -> None:
                 st.session_state.pending_payment = None
 
 
+def queue_document_question() -> None:
+    question = (st.session_state.get("doc_text_input") or "").strip()
+    if not question:
+        return
+    if st.session_state.get("doc_request_inflight"):
+        return
+    st.session_state.doc_pending_question = question
+    st.session_state.doc_text_input = ""
+
+
+def handle_pending_document_question() -> None:
+    document_id = st.session_state.get("document_id")
+    question = st.session_state.pop("doc_pending_question", None)
+    if not document_id or not question:
+        return
+
+    st.session_state.doc_request_inflight = True
+    with st.chat_message("user"):
+        st.markdown(question)
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("正在结合资料生成回答..."):
+                resp = requests.post(
+                    f"{API_ROOT}/documents/{document_id}/ask",
+                    json={"query": question},
+                    timeout=60,
+                )
+            if resp.status_code == 200:
+                answer = resp.json().get("answer", "资料问答完成，但未返回明确答案。")
+                st.markdown(answer)
+                append_chat_pair(
+                    "doc",
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
+                )
+            else:
+                error_text = resp.json().get("detail", resp.text) if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+                st.error(error_text)
+        except Exception as exc:
+            st.error(f"资料问答失败：{exc}")
+        finally:
+            st.session_state.doc_request_inflight = False
+    st.rerun()
+
+
 def upload_document_panel() -> None:
     st.markdown("### 资料解析工作台")
     uploaded = st.file_uploader("上传保险条款 PDF / txt / 图片", type=["pdf", "txt", "png", "jpg", "jpeg", "webp"])
@@ -1328,19 +1522,26 @@ def upload_document_panel() -> None:
         for msg in active_messages("doc"):
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-        q = st.text_input("围绕已上传资料追问", placeholder="例如：这份条款 70 岁能不能买？", key="doc_chat_question")
-        if q and st.button("询问资料", use_container_width=True):
-            resp = requests.post(
-                f"{API_ROOT}/documents/{st.session_state.document_id}/ask",
-                json={"query": q},
-                timeout=60,
+
+        handle_pending_document_question()
+
+        doc_input_col, doc_send_col = st.columns([10, 1])
+        with doc_input_col:
+            st.text_input(
+                "资料输入",
+                placeholder="围绕已上传资料追问，例如：这份条款 70 岁能不能买？",
+                key="doc_text_input",
+                label_visibility="collapsed",
+                disabled=st.session_state.get("doc_request_inflight", False),
             )
-            if resp.status_code == 200:
-                answer = resp.json()["answer"]
-                append_chat_pair("doc", {"role": "user", "content": q}, {"role": "assistant", "content": answer})
-                st.rerun()
-            else:
-                st.error(resp.text)
+        with doc_send_col:
+            st.button(
+                "➤",
+                key="doc_send_button",
+                use_container_width=True,
+                on_click=queue_document_question,
+                disabled=st.session_state.get("doc_request_inflight", False),
+            )
 
 
 def metrics_panel() -> None:

@@ -29,6 +29,16 @@ class RAGEngine:
             "last_eval": None,
         }
 
+    def warmup(self) -> None:
+        """Preload retrieval resources so the first user-visible query is not cold."""
+        start = time.perf_counter()
+        try:
+            self.retriever.warmup_vector_index()
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.info(f"RAG Engine warmup complete in {elapsed:.0f} ms.")
+        except Exception as exc:
+            logger.warning(f"RAG Engine warmup skipped: {exc}")
+
     def _record_metrics(self, result: dict, latency_ms: float, cache_hit: bool = False) -> None:
         self._metrics["total_queries"] += 1
         self._metrics["total_latency_ms"] += latency_ms

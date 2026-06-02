@@ -38,6 +38,10 @@ class GraphRetriever:
         if self.driver:
             self.driver.close()
 
+    def warmup_vector_index(self) -> None:
+        """Load HybridRAG vector records and optional BGE cache before the first query."""
+        self.vector_index.load()
+
     def get_graph_stats(self) -> dict:
         if not self.driver:
             return {"connected": False, "labels": {}, "relationships": 0}
