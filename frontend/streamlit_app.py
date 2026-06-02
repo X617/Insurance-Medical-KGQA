@@ -1,7 +1,10 @@
 import base64
+from datetime import date, timedelta
+import hashlib
 import html
 import json
 import os
+from pathlib import Path
 import uuid
 from typing import Any, Dict, List
 
@@ -20,6 +23,8 @@ st.set_page_config(
 API_ROOT = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 CHAT_URL = os.getenv("API_URL", f"{API_ROOT}/chat")
 STREAM_URL = f"{API_ROOT}/chat/stream"
+USER_STORE_PATH = Path("data/demo_users.json")
+PAYMENT_QR_PATH = Path("fig/IMG_8724.JPG")
 
 PRIMARY = "#2563eb"
 SECONDARY = "#0f766e"
@@ -34,6 +39,7 @@ st.markdown(
 <style>
 .stApp {{ background: {BG}; color: {TEXT}; }}
 [data-testid="stSidebar"] {{ background: #ffffff; border-right: 1px solid #e5e7eb; }}
+[data-testid="stAppViewContainer"] .main .block-container {{ padding-bottom: 8rem; }}
 h1, h2, h3 {{ color: {PRIMARY} !important; letter-spacing: 0; }}
 .hero {{
     padding: 1.4rem 0 0.8rem 0;
@@ -171,6 +177,87 @@ h1, h2, h3 {{ color: {PRIMARY} !important; letter-spacing: 0; }}
     padding: .7rem .85rem;
     margin-bottom: .55rem;
 }}
+.chat-rail {{
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: .7rem;
+    min-height: calc(100vh - 2rem);
+}}
+.rail-title {{ font-weight: 800; color: #111827; font-size: 1.05rem; margin-bottom: .3rem; }}
+.rail-caption {{ color: #64748b; font-size: .78rem; margin-bottom: .55rem; }}
+.user-card {{
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: .7rem .75rem;
+    margin: .7rem 0;
+}}
+.user-avatar {{
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: #b45309;
+    color: white;
+    font-size: .78rem;
+    font-weight: 800;
+    margin-right: .45rem;
+}}
+.current-plan {{
+    border: 1px solid #dbeafe;
+    background: #eff6ff;
+    border-radius: 8px;
+    padding: .7rem .8rem;
+    margin: .65rem 0;
+}}
+.plan-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: .75rem;
+}}
+.plan-card {{
+    background: #fff;
+    border: 1px solid #dbe3ef;
+    border-radius: 8px;
+    padding: 1rem;
+    min-height: 220px;
+}}
+.plan-name {{ font-weight: 850; color: #111827; font-size: 1.08rem; }}
+.plan-price {{ color: #2563eb; font-weight: 850; font-size: 1.35rem; margin: .3rem 0 .45rem; }}
+.payment-box {{
+    background: #fff;
+    border: 1px solid #fed7aa;
+    border-left: 5px solid #f59e0b;
+    border-radius: 8px;
+    padding: 1rem;
+    margin-top: .8rem;
+}}
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) {{
+    position: fixed;
+    left: var(--chat-input-left, 28rem);
+    right: 2.2rem;
+    bottom: .85rem;
+    z-index: 999;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: .55rem .65rem;
+    box-shadow: 0 16px 36px rgba(15, 23, 42, .14);
+}}
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) input {{
+    background: #f3f6fb;
+    border: 0 !important;
+}}
+div[data-testid="stHorizontalBlock"]:has(> div:nth-child(1) input[aria-label="聊天输入"]):has(> div:nth-child(2) button) button {{
+    min-height: 2.45rem;
+}}
+[data-testid="stSidebar"] > div:first-child {{
+    max-height: 100vh;
+    overflow-y: auto;
+}}
 </style>
 """,
     unsafe_allow_html=True,
@@ -210,6 +297,264 @@ def cached_subgraph(seed: str, depth: int, limit: int) -> Dict[str, Any]:
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_graph_analysis(seed: str, depth: int, limit: int) -> Dict[str, Any]:
     return api_get("/graph/analysis", query=seed, depth=depth, limit=limit, timeout=10.0)
+
+
+PLAN_CATALOG = {
+    "Free": {
+        "price": "免费",
+        "highlight": "基础图谱问答与交互体验",
+        "features": ["基础 GraphRAG 问答", "少量资料解析", "基础可信问答功能"],
+    },
+    "Go": {
+        "price": "¥5/月",
+        "highlight": "更长上下文与快速图谱探索",
+        "features": ["更长会话历史", "图谱探索增强", "资料问答优先队列"],
+    },
+    "Plus": {
+        "price": "¥28/月",
+        "highlight": "DeepSeek V4 Pro 与算法增强",
+        "features": ["HyDE / DRIFT 检索", "条款抽取入图", "评测报告导出"],
+    },
+    "Ultra": {
+        "price": "¥288/月",
+        "highlight": "高阶医养顾问与企业能力",
+        "features": ["批量资料解析", "专属图谱空间", "高并发服务性能"],
+    },
+}
+
+
+def today_text() -> str:
+    return date.today().isoformat()
+
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+
+
+def load_user_store() -> Dict[str, Any]:
+    if not USER_STORE_PATH.exists():
+        return {"users": {}}
+    try:
+        return json.loads(USER_STORE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"users": {}}
+
+
+def save_user_store(store: Dict[str, Any]) -> None:
+    USER_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_STORE_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def make_chat_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+def compact_title(text: str) -> str:
+    text = " ".join(str(text or "").replace("\n", " ").split())
+    text = text.strip(" ，。！？,.!?;；:：")
+    if not text:
+        return "新对话"
+    return text[:18] + ("..." if len(text) > 18 else "")
+
+
+def empty_chat(chat_id: str) -> Dict[str, Any]:
+    return {
+        "id": chat_id,
+        "title": "新对话",
+        "messages": [],
+        "created_at": today_text(),
+        "updated_at": today_text(),
+    }
+
+
+def default_user(username: str) -> Dict[str, Any]:
+    qa_id = make_chat_id("qa")
+    doc_id = make_chat_id("doc")
+    return {
+        "username": username,
+        "membership": {"tier": "Free", "expires_at": "-", "renewal": "未订阅"},
+        "chat_spaces": {
+            "qa": {"active_id": qa_id, "sessions": {qa_id: empty_chat(qa_id)}},
+            "doc": {"active_id": doc_id, "sessions": {doc_id: empty_chat(doc_id)}},
+        },
+    }
+
+
+def ensure_local_session() -> None:
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = None
+    if "auth_error" not in st.session_state:
+        st.session_state.auth_error = ""
+    if "chat_manager_open" not in st.session_state:
+        st.session_state.chat_manager_open = False
+    if "chat_manager_scope" not in st.session_state:
+        st.session_state.chat_manager_scope = "qa"
+    if "pending_payment" not in st.session_state:
+        st.session_state.pending_payment = None
+    if "local_guest" not in st.session_state:
+        st.session_state.local_guest = default_user("访客")
+    if "messages" in st.session_state and st.session_state.messages:
+        guest_space = st.session_state.local_guest["chat_spaces"]["qa"]
+        guest_chat = guest_space["sessions"][guest_space["active_id"]]
+        if not guest_chat["messages"]:
+            guest_chat["messages"] = st.session_state.messages
+            first_user = next((m.get("content", "") for m in st.session_state.messages if m.get("role") == "user"), "")
+            guest_chat["title"] = compact_title(first_user)
+
+
+def current_user_record() -> Dict[str, Any]:
+    ensure_local_session()
+    username = st.session_state.auth_user
+    if not username:
+        return st.session_state.local_guest
+    store = load_user_store()
+    user = store.get("users", {}).get(username)
+    if not user:
+        user = default_user(username)
+        store.setdefault("users", {})[username] = user
+        save_user_store(store)
+    return user
+
+
+def save_current_user_record(user: Dict[str, Any]) -> None:
+    if st.session_state.get("auth_user"):
+        store = load_user_store()
+        store.setdefault("users", {})[st.session_state.auth_user] = user
+        save_user_store(store)
+    else:
+        st.session_state.local_guest = user
+
+
+def active_chat(space_key: str = "qa") -> Dict[str, Any]:
+    user = current_user_record()
+    spaces = user.setdefault("chat_spaces", {})
+    if space_key not in spaces:
+        chat_id = make_chat_id(space_key)
+        spaces[space_key] = {"active_id": chat_id, "sessions": {chat_id: empty_chat(chat_id)}}
+        save_current_user_record(user)
+    space = spaces[space_key]
+    if space.get("active_id") not in space.get("sessions", {}):
+        chat_id = make_chat_id(space_key)
+        space["active_id"] = chat_id
+        space.setdefault("sessions", {})[chat_id] = empty_chat(chat_id)
+        save_current_user_record(user)
+    return space["sessions"][space["active_id"]]
+
+
+def active_messages(space_key: str = "qa") -> List[Dict[str, Any]]:
+    return active_chat(space_key).setdefault("messages", [])
+
+
+def sync_legacy_messages() -> None:
+    st.session_state.messages = active_messages("qa")
+
+
+def start_new_chat(space_key: str = "qa") -> None:
+    user = current_user_record()
+    chat_id = make_chat_id(space_key)
+    space = user["chat_spaces"].setdefault(space_key, {"active_id": chat_id, "sessions": {}})
+    space["sessions"][chat_id] = empty_chat(chat_id)
+    space["active_id"] = chat_id
+    save_current_user_record(user)
+    sync_legacy_messages()
+
+
+def select_chat(space_key: str, chat_id: str) -> None:
+    user = current_user_record()
+    space = user["chat_spaces"].get(space_key)
+    if space and chat_id in space.get("sessions", {}):
+        space["active_id"] = chat_id
+        save_current_user_record(user)
+        sync_legacy_messages()
+
+
+def append_chat_pair(space_key: str, user_msg: Dict[str, Any], assistant_msg: Dict[str, Any]) -> None:
+    user = current_user_record()
+    chat = active_chat(space_key)
+    was_empty = not chat.get("messages")
+    chat.setdefault("messages", []).extend([user_msg, assistant_msg])
+    if was_empty or chat.get("title") == "新对话":
+        chat["title"] = compact_title(user_msg.get("content", ""))
+    chat["updated_at"] = today_text()
+    save_current_user_record(user)
+    sync_legacy_messages()
+
+
+def clear_active_chat(space_key: str = "qa") -> None:
+    user = current_user_record()
+    chat = active_chat(space_key)
+    chat["messages"] = []
+    chat["title"] = "新对话"
+    chat["updated_at"] = today_text()
+    save_current_user_record(user)
+    sync_legacy_messages()
+
+
+def login_user(username: str, password: str) -> bool:
+    username = username.strip()
+    store = load_user_store()
+    user = store.get("users", {}).get(username)
+    if not user:
+        st.session_state.auth_error = "账号不存在，请先注册。"
+        return False
+    if hash_password(password, user.get("salt", "")) != user.get("password_hash"):
+        st.session_state.auth_error = "密码不正确。"
+        return False
+    st.session_state.auth_user = username
+    st.session_state.auth_error = ""
+    sync_legacy_messages()
+    return True
+
+
+def register_user(username: str, password: str, password_confirm: str) -> bool:
+    username = username.strip()
+    if len(username) < 3:
+        st.session_state.auth_error = "账号至少需要 3 个字符。"
+        return False
+    if len(password) < 6:
+        st.session_state.auth_error = "密码至少需要 6 位。"
+        return False
+    if password != password_confirm:
+        st.session_state.auth_error = "两次输入的密码不一致。"
+        return False
+    store = load_user_store()
+    if username in store.get("users", {}):
+        st.session_state.auth_error = "账号已存在，请直接登录。"
+        return False
+    salt = uuid.uuid4().hex
+    user = default_user(username)
+    user["salt"] = salt
+    user["password_hash"] = hash_password(password, salt)
+    store.setdefault("users", {})[username] = user
+    save_user_store(store)
+    st.session_state.auth_user = username
+    st.session_state.auth_error = ""
+    sync_legacy_messages()
+    return True
+
+
+def logout_user() -> None:
+    st.session_state.auth_user = None
+    st.session_state.auth_error = ""
+    sync_legacy_messages()
+
+
+def set_membership(plan: str) -> None:
+    user = current_user_record()
+    if plan == "Free":
+        user["membership"] = {"tier": "Free", "expires_at": "-", "renewal": "未订阅"}
+    else:
+        user["membership"] = {
+            "tier": plan,
+            "expires_at": (date.today() + timedelta(days=30)).isoformat(),
+            "renewal": "微信支付月付",
+        }
+    save_current_user_record(user)
+    st.session_state.pending_payment = None
+
+
+ensure_local_session()
+sync_legacy_messages()
 
 
 def render_metric(label: str, value: str) -> None:
@@ -730,6 +1075,186 @@ def render_trace(trace: List[Dict[str, Any]]) -> None:
         )
 
 
+def render_login_box() -> None:
+    if st.session_state.get("auth_user"):
+        return
+    with st.expander("登录 / 注册", expanded=True):
+        mode = st.radio("账号入口", ["登录", "注册"], horizontal=True, label_visibility="collapsed")
+        username = st.text_input("账号", placeholder="请输入账号/手机号", key=f"auth_user_{mode}")
+        password = st.text_input("密码", type="password", key=f"auth_pwd_{mode}")
+        if mode == "注册":
+            password_confirm = st.text_input("再次输入密码", type="password", key="auth_pwd_confirm")
+            if st.button("注册并登录", use_container_width=True):
+                register_user(username, password, password_confirm)
+        else:
+            if st.button("登录", use_container_width=True):
+                login_user(username, password)
+        if st.session_state.get("auth_error"):
+            st.error(st.session_state.auth_error)
+        st.caption("演示版使用本地账号系统；Google 登录需要 OAuth 回调域名，正式部署时可接入。")
+
+
+def render_user_card() -> None:
+    user = current_user_record()
+    membership = user.get("membership", {})
+    username = st.session_state.get("auth_user") or user.get("username", "访客")
+    initials = (username[:2] or "KG").upper()
+    st.markdown(
+        f"""
+<div class="user-card">
+  <span class="user-avatar">{html.escape(initials)}</span>
+  <b>{html.escape(username)}</b>
+  <div class="small-muted">当前会员：{html.escape(str(membership.get("tier", "Free")))} · 到期：{html.escape(str(membership.get("expires_at", "-")))}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("auth_user"):
+        if st.button("退出登录", use_container_width=True):
+            logout_user()
+            st.rerun()
+    else:
+        render_login_box()
+
+
+def render_chat_manager() -> None:
+    if not st.session_state.chat_manager_open:
+        if st.button("☰", help="展开 Chat 管理", use_container_width=True):
+            st.session_state.chat_manager_open = True
+            st.rerun()
+        if st.button("＋", help="新建当前空间对话", use_container_width=True):
+            start_new_chat(st.session_state.chat_manager_scope)
+            st.rerun()
+        if st.button("💎", help="会员中心", use_container_width=True):
+            st.session_state.show_membership_tab = True
+            st.rerun()
+        return
+
+    st.markdown('<div class="rail-title">Chat 管理</div>', unsafe_allow_html=True)
+    col_title, col_close = st.columns([3, 1])
+    with col_title:
+        st.caption("独立管理问答与资料解析会话")
+    with col_close:
+        if st.button("收起", key="collapse_chat_rail", use_container_width=True):
+            st.session_state.chat_manager_open = False
+            st.rerun()
+
+    scope_label = st.radio(
+        "会话空间",
+        ["智能问答", "资料解析"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="chat_manager_scope_label",
+    )
+    st.session_state.chat_manager_scope = "qa" if scope_label == "智能问答" else "doc"
+    scope = st.session_state.chat_manager_scope
+
+    if st.button("新建 Chat", use_container_width=True):
+        start_new_chat(scope)
+        st.rerun()
+    search = st.text_input("Search Chat", placeholder="按标题搜索", key=f"chat_search_{scope}")
+
+    user = current_user_record()
+    space = user["chat_spaces"].setdefault(scope, {"active_id": "", "sessions": {}})
+    sessions = list(space.get("sessions", {}).values())
+    sessions = sorted(sessions, key=lambda item: item.get("updated_at", ""), reverse=True)
+    if search.strip():
+        keyword = search.strip().lower()
+        sessions = [item for item in sessions if keyword in item.get("title", "").lower()]
+
+    st.markdown("**Recents**")
+    if not sessions:
+        st.caption("暂无匹配会话")
+    for item in sessions[:18]:
+        title = item.get("title") or "新对话"
+        active = item.get("id") == space.get("active_id")
+        label = f"● {title}" if active else title
+        if st.button(label, key=f"select_{scope}_{item.get('id')}", use_container_width=True):
+            select_chat(scope, item["id"])
+            st.rerun()
+
+    st.divider()
+    render_user_card()
+    membership = current_user_record().get("membership", {})
+    st.markdown(
+        f"""
+<div class="current-plan">
+  <b>{html.escape(str(membership.get("tier", "Free")))}</b>
+  <div class="small-muted">{html.escape(str(membership.get("renewal", "未订阅")))} · 有效期 {html.escape(str(membership.get("expires_at", "-")))}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    if st.button("查看会员方案", use_container_width=True):
+        st.session_state.show_membership_tab = True
+
+
+def membership_panel() -> None:
+    st.markdown("### 会员订阅")
+    user = current_user_record()
+    membership = user.get("membership", {})
+    st.markdown(
+        f"""
+<div class="current-plan">
+  <b>当前账号：</b>{html.escape(str(user.get("username", "访客")))}
+  <br/><b>当前会员：</b>{html.escape(str(membership.get("tier", "Free")))}
+  <br/><span class="small-muted">有效期：{html.escape(str(membership.get("expires_at", "-")))} · {html.escape(str(membership.get("renewal", "未订阅")))}</span>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(4)
+    for col, (plan, meta) in zip(cols, PLAN_CATALOG.items()):
+        with col:
+            features = "".join(f"<li>{html.escape(feature)}</li>" for feature in meta["features"])
+            st.markdown(
+                f"""
+<div class="plan-card">
+  <div class="plan-name">{html.escape(plan)}</div>
+  <div class="plan-price">{html.escape(meta["price"])}</div>
+  <div class="small-muted">{html.escape(meta["highlight"])}</div>
+  <ul>{features}</ul>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+            if plan == membership.get("tier"):
+                st.button("当前方案", disabled=True, use_container_width=True, key=f"plan_current_{plan}")
+            elif plan == "Free":
+                if st.button("切换 Free", use_container_width=True, key="plan_free"):
+                    set_membership("Free")
+            else:
+                if st.button(f"订阅 {plan}", type="primary", use_container_width=True, key=f"plan_{plan}"):
+                    st.session_state.pending_payment = plan
+
+    pending = st.session_state.get("pending_payment")
+    if pending:
+        st.markdown(
+            f"""
+<div class="payment-box">
+  <b>微信支付收银台（演示沙箱）</b>
+  <div class="small-muted">方案：{html.escape(pending)} · 金额：{html.escape(PLAN_CATALOG[pending]["price"])}</div>
+  <div class="small-muted">正式系统可接入微信/支付宝 Native Pay；当前演示展示收款码并支持模拟支付成功。</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        col_qr, col_actions = st.columns([1, 2])
+        with col_qr:
+            if PAYMENT_QR_PATH.exists():
+                st.image(str(PAYMENT_QR_PATH), caption="微信收款码", use_column_width=True)
+            else:
+                st.warning("未找到 fig/IMG_8724.JPG，请确认收款码图片存在。")
+        with col_actions:
+            st.markdown("[跳转到微信支付](https://pay.weixin.qq.com/)")
+            # st.caption("浏览器环境可能不会直接拉起微信客户端，答辩时展示收款码即可形成闭环。")
+            if st.button("模拟支付成功并开通会员", type="primary", use_container_width=True):
+                set_membership(pending)
+                st.success(f"{pending} 已开通，有效期 30 天。")
+            if st.button("取消支付", use_container_width=True):
+                st.session_state.pending_payment = None
+
+
 def upload_document_panel() -> None:
     st.markdown("### 资料解析工作台")
     uploaded = st.file_uploader("上传保险条款 PDF / txt / 图片", type=["pdf", "txt", "png", "jpg", "jpeg", "webp"])
@@ -799,7 +1324,11 @@ def upload_document_panel() -> None:
                 else:
                     st.error(resp.text)
 
-        q = st.text_input("围绕已上传资料追问", placeholder="例如：这份条款 70 岁能不能买？")
+        st.markdown("#### 资料会话")
+        for msg in active_messages("doc"):
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        q = st.text_input("围绕已上传资料追问", placeholder="例如：这份条款 70 岁能不能买？", key="doc_chat_question")
         if q and st.button("询问资料", use_container_width=True):
             resp = requests.post(
                 f"{API_ROOT}/documents/{st.session_state.document_id}/ask",
@@ -807,7 +1336,9 @@ def upload_document_panel() -> None:
                 timeout=60,
             )
             if resp.status_code == 200:
-                st.markdown(resp.json()["answer"])
+                answer = resp.json()["answer"]
+                append_chat_pair("doc", {"role": "user", "content": q}, {"role": "assistant", "content": answer})
+                st.rerun()
             else:
                 st.error(resp.text)
 
@@ -887,7 +1418,7 @@ def request_chat_reply(prompt: str) -> Dict[str, Any]:
         }
     history_payload = [
         {"role": m["role"], "content": m["content"]}
-        for m in st.session_state.messages
+        for m in active_messages("qa")
     ][-6:]
 
     try:
@@ -933,7 +1464,7 @@ def request_chat_reply(prompt: str) -> Dict[str, Any]:
 def iter_sse_chat(prompt: str):
     history_payload = [
         {"role": m["role"], "content": m["content"]}
-        for m in st.session_state.messages
+        for m in active_messages("qa")
     ][-6:]
     response = requests.post(
         STREAM_URL,
@@ -986,7 +1517,7 @@ def process_chat_turn(prompt: str) -> None:
         return
     user_msg = {"role": "user", "content": prompt}
     assistant_msg = request_chat_reply(prompt)
-    st.session_state.messages.extend([user_msg, assistant_msg])
+    append_chat_pair("qa", user_msg, assistant_msg)
 
 
 def render_current_turn(prompt: str) -> None:
@@ -1071,7 +1602,7 @@ def render_current_turn(prompt: str) -> None:
             expanded_graph=bool(assistant_msg.get("graph", {}).get("nodes")),
         )
 
-    st.session_state.messages.extend([user_msg, assistant_msg])
+    append_chat_pair("qa", user_msg, assistant_msg)
 
 
 def render_live_reasoning(stage_box, active: str = "") -> None:
@@ -1131,7 +1662,7 @@ def algorithm_explain_panel() -> None:
 
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = active_messages("qa")
 if "sidebar_prompt" not in st.session_state:
     st.session_state.sidebar_prompt = None
 
@@ -1141,7 +1672,7 @@ def choose_sidebar_prompt(prompt: str) -> None:
 
 
 def clear_chat() -> None:
-    st.session_state.messages = []
+    clear_active_chat("qa")
     st.session_state.sidebar_prompt = None
 
 
@@ -1197,117 +1728,147 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
     st.button("清空当前对话", use_container_width=True, on_click=clear_chat)
 
+rail_weight = 0.16 if st.session_state.chat_manager_open else 0.035
+rail_col, app_col = st.columns([rail_weight, 1.0 - rail_weight], gap="small")
+chat_input_left = "37.5rem" if st.session_state.chat_manager_open else "25.5rem"
 st.markdown(
-    """
+    f"<style>:root {{ --chat-input-left: {chat_input_left}; }}</style>",
+    unsafe_allow_html=True,
+)
+
+with rail_col:
+    render_chat_manager()
+
+with app_col:
+    st.markdown(
+        """
 <div class="hero">
   <div class="hero-title">泰康保险医养智能助手</div>
   <div class="hero-subtitle">基于 Neo4j 知识图谱、GraphRAG、Agent 推理链与多源资料问答的跨域智能系统</div>
 </div>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
-prompt_from_sidebar = st.session_state.sidebar_prompt
-if prompt_from_sidebar:
-    st.session_state.sidebar_prompt = None
-    chat_prompt_to_submit = prompt_from_sidebar
-else:
-    chat_prompt_to_submit = None
+    prompt_from_sidebar = st.session_state.sidebar_prompt
+    if prompt_from_sidebar:
+        st.session_state.sidebar_prompt = None
+        chat_prompt_to_submit = prompt_from_sidebar
+    else:
+        chat_prompt_to_submit = None
 
-if typed_prompt := st.chat_input("请描述您的情况，例如：70岁老人有高血压，推荐什么保险？"):
-    chat_prompt_to_submit = typed_prompt
+    tab_chat, tab_upload, tab_graph, tab_metrics, tab_algo, tab_member = st.tabs(
+        ["智能问答", "资料解析", "图谱探索", "系统评测", "算法解释", "会员订阅"]
+    )
 
-tab_chat, tab_upload, tab_graph, tab_metrics, tab_algo = st.tabs(["智能问答", "资料解析", "图谱探索", "系统评测", "算法解释"])
+    with tab_chat:
+        with st.container():
+            qa_messages = active_messages("qa")
+            for idx, msg in enumerate(qa_messages):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    if msg["role"] == "assistant":
+                        render_assistant_details(msg, expanded_graph=False)
 
-with tab_chat:
-    for idx, msg in enumerate(st.session_state.messages):
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg["role"] == "assistant":
-                render_assistant_details(msg, expanded_graph=False)
+            if chat_prompt_to_submit:
+                render_current_turn(chat_prompt_to_submit)
+                qa_messages = active_messages("qa")
 
-    if chat_prompt_to_submit:
-        render_current_turn(chat_prompt_to_submit)
+            if not qa_messages:
+                st.info("从下方输入问题，或在左侧选择一个演示场景开始。")
 
-    if not st.session_state.messages:
-        st.info("从下方输入问题，或在左侧选择一个演示场景开始。")
-
-with tab_upload:
-    upload_document_panel()
-
-with tab_graph:
-    st.markdown("### 图谱子图探索")
-    st.caption("交互式子图工作台：支持更深层关系扩展、拖拽节点、滚轮缩放和证据路径查看。")
-    col_query, col_depth, col_limit = st.columns([4, 1.4, 1.6])
-    with col_query:
-        seed = st.text_input("输入实体或问题关键词", value="高血压")
-    with col_depth:
-        depth = st.slider("探索深度", 1, 4, 2)
-    with col_limit:
-        limit = st.slider("路径上限", 20, 180, 90, step=10)
-    if st.button("加载交互式子图", use_container_width=True):
-        st.session_state.explore_graph = cached_subgraph(seed, depth, limit)
-    if st.session_state.get("explore_graph"):
-        graph = st.session_state.explore_graph
-        meta = graph.get("meta", {})
-        count_cols = st.columns(4)
-        with count_cols[0]:
-            render_metric("节点", str(meta.get("node_count", len(graph.get("nodes", [])))))
-        with count_cols[1]:
-            render_metric("关系", str(meta.get("edge_count", len(graph.get("edges", [])))))
-        with count_cols[2]:
-            render_metric("深度", str(meta.get("depth", depth)))
-        with count_cols[3]:
-            render_metric("种子实体", str(meta.get("start_count", "-")))
-        render_graph(graph, height=520, max_nodes=95, max_edges=180)
-
-        path_col, node_col = st.columns([1.1, 1])
-        with path_col:
-            st.markdown("**证据路径预览**")
-            paths = graph.get("paths", [])[:12]
-            if paths:
-                for path in paths:
-                    st.markdown(f'<div class="source-line">{html.escape(str(path))}</div>', unsafe_allow_html=True)
-            else:
-                st.info("暂无路径信息。")
-        with node_col:
-            st.markdown("**高连接节点**")
-            top_nodes = sorted(
-                graph.get("nodes", []),
-                key=lambda item: item.get("degree", 0),
-                reverse=True,
-            )[:12]
-            st.dataframe(
-                [
-                    {
-                        "类型": item.get("label"),
-                        "名称": item.get("name"),
-                        "度数": item.get("degree", 0),
-                        "种子": "是" if item.get("seed") else "",
-                    }
-                    for item in top_nodes
-                ],
-                use_container_width=True,
-                hide_index=True,
+        input_col, send_col = st.columns([10, 1])
+        with input_col:
+            typed_prompt = st.text_input(
+                "聊天输入",
+                placeholder="请描述您的情况，例如：70岁老人有高血压，推荐什么保险？",
+                label_visibility="collapsed",
+                key="qa_text_input",
             )
-        analysis = cached_graph_analysis(seed, depth, limit).get("analysis", {})
-        if analysis:
-            st.markdown("**局部图分析**")
-            st.info(analysis.get("summary", ""))
-            a_col, b_col = st.columns(2)
-            with a_col:
-                st.markdown("核心实体排行")
-                st.dataframe(analysis.get("core_nodes", []), use_container_width=True, hide_index=True)
-            with b_col:
-                st.markdown("社区摘要")
-                st.dataframe(analysis.get("communities", []), use_container_width=True, hide_index=True)
-            with st.expander("k-core 近似分层与最短路径", expanded=False):
-                st.dataframe(analysis.get("k_core_layers", []), use_container_width=True, hide_index=True)
-                for path in analysis.get("shortest_paths", []):
-                    st.caption(path)
+        with send_col:
+            send_clicked = st.button("➤", use_container_width=True, key="qa_send_button")
+        if send_clicked and typed_prompt.strip():
+            render_current_turn(typed_prompt)
 
-with tab_metrics:
-    metrics_panel()
+    with tab_upload:
+        upload_document_panel()
 
-with tab_algo:
-    algorithm_explain_panel()
+    with tab_graph:
+        st.markdown("### 图谱子图探索")
+        st.caption("交互式子图工作台：支持更深层关系扩展、拖拽节点、滚轮缩放和证据路径查看。")
+        col_query, col_depth, col_limit = st.columns([4, 1.4, 1.6])
+        with col_query:
+            seed = st.text_input("输入实体或问题关键词", value="高血压")
+        with col_depth:
+            depth = st.slider("探索深度", 1, 4, 2)
+        with col_limit:
+            limit = st.slider("路径上限", 20, 180, 90, step=10)
+        if st.button("加载交互式子图", use_container_width=True):
+            st.session_state.explore_graph = cached_subgraph(seed, depth, limit)
+        if st.session_state.get("explore_graph"):
+            graph = st.session_state.explore_graph
+            meta = graph.get("meta", {})
+            count_cols = st.columns(4)
+            with count_cols[0]:
+                render_metric("节点", str(meta.get("node_count", len(graph.get("nodes", [])))))
+            with count_cols[1]:
+                render_metric("关系", str(meta.get("edge_count", len(graph.get("edges", [])))))
+            with count_cols[2]:
+                render_metric("深度", str(meta.get("depth", depth)))
+            with count_cols[3]:
+                render_metric("种子实体", str(meta.get("start_count", "-")))
+            render_graph(graph, height=520, max_nodes=95, max_edges=180)
+
+            path_col, node_col = st.columns([1.1, 1])
+            with path_col:
+                st.markdown("**证据路径预览**")
+                paths = graph.get("paths", [])[:12]
+                if paths:
+                    for path in paths:
+                        st.markdown(f'<div class="source-line">{html.escape(str(path))}</div>', unsafe_allow_html=True)
+                else:
+                    st.info("暂无路径信息。")
+            with node_col:
+                st.markdown("**高连接节点**")
+                top_nodes = sorted(
+                    graph.get("nodes", []),
+                    key=lambda item: item.get("degree", 0),
+                    reverse=True,
+                )[:12]
+                st.dataframe(
+                    [
+                        {
+                            "类型": item.get("label"),
+                            "名称": item.get("name"),
+                            "度数": item.get("degree", 0),
+                            "种子": "是" if item.get("seed") else "",
+                        }
+                        for item in top_nodes
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            analysis = cached_graph_analysis(seed, depth, limit).get("analysis", {})
+            if analysis:
+                st.markdown("**局部图分析**")
+                st.info(analysis.get("summary", ""))
+                a_col, b_col = st.columns(2)
+                with a_col:
+                    st.markdown("核心实体排行")
+                    st.dataframe(analysis.get("core_nodes", []), use_container_width=True, hide_index=True)
+                with b_col:
+                    st.markdown("社区摘要")
+                    st.dataframe(analysis.get("communities", []), use_container_width=True, hide_index=True)
+                with st.expander("k-core 近似分层与最短路径", expanded=False):
+                    st.dataframe(analysis.get("k_core_layers", []), use_container_width=True, hide_index=True)
+                    for path in analysis.get("shortest_paths", []):
+                        st.caption(path)
+
+    with tab_metrics:
+        metrics_panel()
+
+    with tab_algo:
+        algorithm_explain_panel()
+
+    with tab_member:
+        membership_panel()

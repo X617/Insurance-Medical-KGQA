@@ -16,8 +16,11 @@ __pycache__/
 # 忽略日志文件
 *.log
 logs/
+data/demo_users.json
 
 # 忽略评测与本地模型缓存产物
 reports/
 models/
 .cache/
+fig/
+!fig/IMG_8724.JPG
